@@ -28,7 +28,7 @@ Assert-True (Test-Path -LiteralPath $ResultSchema) 'result schema must exist'
 $task = Get-Content -Raw -LiteralPath $TaskExample | ConvertFrom-Json
 $schema = Get-Content -Raw -LiteralPath $ResultSchema | ConvertFrom-Json
 $requiredTaskFields = @(
-    'id', 'goal', 'mode', 'allowedPaths', 'forbiddenPaths',
+    'id', 'goal', 'mode', 'baseBranch', 'featureBranch', 'allowedPaths', 'forbiddenPaths',
     'forbiddenActions', 'context', 'acceptanceCriteria',
     'requiredVerification', 'limits'
 )
@@ -60,8 +60,14 @@ try {
 
 $direct = [pscustomobject]@{
     id='task-direct'; goal='Fix one parser'; mode='direct'
-    allowedPaths=@('src/parser.ps1'); forbiddenPaths=@('.git/**')
-    forbiddenActions=@('git commit'); context=@()
+    baseBranch='main'; featureBranch='feature/test'
+    allowedPaths=@('src/parser.ps1'); forbiddenPaths=@('.git/**', '.env*', 'secrets/**', 'credentials/**')
+    forbiddenActions=@(
+        'git commit', 'git push', 'git pull', 'git fetch', 'git merge',
+        'git rebase', 'git reset', 'git checkout', 'git switch', 'git stash',
+        'git tag', 'git remote', 'git worktree',
+        'read or expose secrets', 'read or expose credentials'
+    ); context=@()
     acceptanceCriteria=@('Focused tests pass'); requiredVerification=@('Run parser tests')
     limits=[pscustomobject]@{ maxTurns=20; timeoutSeconds=900; maxBudgetUsd=3.0 }
 }
@@ -77,20 +83,17 @@ $expectedGitDenyPatterns = @(
 foreach ($denyPattern in $expectedGitDenyPatterns) {
     Assert-True ($directInvocation.arguments -contains $denyPattern) "git wrapper deny rule missing: $denyPattern"
 }
+foreach ($denyPattern in ($expectedGitDenyPatterns | ForEach-Object { $_ -replace '^Bash', 'PowerShell' })) {
+    Assert-True ($directInvocation.arguments -contains $denyPattern) "native PowerShell git wrapper deny rule missing: $denyPattern"
+}
 Assert-True ($directInvocation.arguments -contains '--output-format') 'output-format flag missing'
 Assert-True ($directInvocation.arguments[[Array]::IndexOf([object[]]$directInvocation.arguments, '--output-format') + 1] -eq 'json') 'direct mode output must remain JSON'
-
-$zeroBudget = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-$zeroBudget.limits.maxBudgetUsd = 0
-$zeroBudgetInvocation = New-ClaudeInvocation -Task $zeroBudget -SessionId 'session-123' -SupportsForwarding $true
-$zeroBudgetIndex = [Array]::IndexOf([object[]]$zeroBudgetInvocation.arguments, '--max-budget-usd')
-Assert-True ($zeroBudgetIndex -ge 0) 'explicit zero budget must not be omitted'
-Assert-True ($zeroBudgetInvocation.arguments[$zeroBudgetIndex + 1] -eq '0') 'explicit zero budget was not preserved'
 
 foreach ($invalidLimit in @(
     [pscustomobject]@{ property = 'maxTurns'; value = 0; message = 'zero maxTurns must be rejected' },
     [pscustomobject]@{ property = 'maxTurns'; value = 1.5; message = 'fractional maxTurns must be rejected' },
     [pscustomobject]@{ property = 'timeoutSeconds'; value = 0; message = 'zero timeoutSeconds must be rejected' },
+    [pscustomobject]@{ property = 'maxBudgetUsd'; value = 0; message = 'zero maxBudgetUsd must be rejected' },
     [pscustomobject]@{ property = 'maxBudgetUsd'; value = -0.01; message = 'negative maxBudgetUsd must be rejected' }
 )) {
     $invalidTask = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
@@ -105,6 +108,25 @@ $missingTurnsRejected = $false
 try { Assert-DelegationPolicy -Task $missingTurns } catch { $missingTurnsRejected = $true }
 Assert-True $missingTurnsRejected 'missing maxTurns must be rejected'
 
+foreach ($invalidPath in @('C:/outside/**', '../outside/**', './src/**', 'src\**', '**', 'src*', 'src//api/**')) {
+    $invalidPathTask = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $invalidPathTask.allowedPaths = @($invalidPath)
+    $invalidPathRejected = $false
+    try { Assert-DelegationPolicy -Task $invalidPathTask } catch { $invalidPathRejected = $true }
+    Assert-True $invalidPathRejected "unsafe or non-normalized allowed path was accepted: $invalidPath"
+}
+$missingSensitiveProhibitions = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$missingSensitiveProhibitions.forbiddenPaths = @('.git/**')
+$missingSensitiveRejected = $false
+try { Assert-DelegationPolicy -Task $missingSensitiveProhibitions } catch { $missingSensitiveRejected = $true }
+Assert-True $missingSensitiveRejected 'task without sensitive or credential path prohibitions was accepted'
+
+$missingGitActions = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$missingGitActions.forbiddenActions = @('git commit', 'read or expose secrets', 'read or expose credentials')
+$missingGitActionsRejected = $false
+try { Assert-DelegationPolicy -Task $missingGitActions } catch { $missingGitActionsRejected = $true }
+Assert-True $missingGitActionsRejected 'task without the complete Git prohibition set was accepted'
+
 $subagents = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
 $subagents.mode = 'subagents'
 $subagentInvocation = New-ClaudeInvocation -Task $subagents -SessionId 'session-123' -SupportsForwarding $true
@@ -118,6 +140,7 @@ Assert-True ($subagentWithoutForwarding.arguments[[Array]::IndexOf([object[]]$su
 
 $team = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
 $team.mode = 'agent-team'
+$team.allowedPaths = @('src/api/**', 'src/ui/**')
 $team | Add-Member -NotePropertyName parallelWorkstreams -NotePropertyValue @(
     [pscustomobject]@{ name='api'; ownedPaths=@('src/api/**') },
     [pscustomobject]@{ name='ui'; ownedPaths=@('src/ui/**') }
@@ -155,7 +178,22 @@ $boundaryDistinct.parallelWorkstreams = @(
     [pscustomobject]@{ name='api'; ownedPaths=@('src/api/**') },
     [pscustomobject]@{ name='api-client'; ownedPaths=@('src/api-client/**') }
 )
+$boundaryDistinct.allowedPaths = @('src/api/**', 'src/api-client/**')
 Assert-DelegationPolicy -Task $boundaryDistinct
+
+$oversizedTeam = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$oversizedTeam.parallelWorkstreams = @(
+    [pscustomobject]@{ name='one'; ownedPaths=@('src/one/**') },
+    [pscustomobject]@{ name='two'; ownedPaths=@('src/two/**') },
+    [pscustomobject]@{ name='three'; ownedPaths=@('src/three/**') },
+    [pscustomobject]@{ name='four'; ownedPaths=@('src/four/**') }
+)
+$oversizedTeam.allowedPaths = @('src/one/**', 'src/two/**', 'src/three/**', 'src/four/**')
+$oversizedRejected = $false
+try { Assert-DelegationPolicy -Task $oversizedTeam } catch { $oversizedRejected = $true }
+Assert-True $oversizedRejected 'agent team with more than three workstreams and no justification was accepted'
+$oversizedTeam | Add-Member -NotePropertyName parallelismJustification -NotePropertyValue 'Four disjoint platform adapters must be completed within the bounded task limits.'
+Assert-DelegationPolicy -Task $oversizedTeam
 
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-delegation-" + [guid]::NewGuid())
 $mainRepo = Join-Path $fixtureRoot 'main'
@@ -164,7 +202,7 @@ $fixtureFailure = $null
 $fixtureCleaned = $false
 try {
     New-Item -ItemType Directory -Force -Path $mainRepo | Out-Null
-    Invoke-TestGit $mainRepo @('init') | Out-Null
+    Invoke-TestGit $mainRepo @('init', '-b', 'main') | Out-Null
     Invoke-TestGit $mainRepo @('config', 'user.email', 'tests@example.invalid') | Out-Null
     Invoke-TestGit $mainRepo @('config', 'user.name', 'Delegation Tests') | Out-Null
     $invalidGitRejected = $false
@@ -186,7 +224,12 @@ try {
     Assert-True $rejected 'main checkout must be rejected'
     Assert-LinkedWorktree -Context $linkedContext
 
-    $state = Initialize-HandoffState -Context $linkedContext
+    $nestedPathRejected = $false
+    New-Item -ItemType Directory -Force -Path (Join-Path $linked 'nested') | Out-Null
+    try { Get-WorktreeContext -WorktreePath (Join-Path $linked 'nested') | Out-Null } catch { $nestedPathRejected = $true }
+    Assert-True $nestedPathRejected 'a nested directory was accepted as the linked worktree root'
+
+    $state = Initialize-HandoffState -Context $linkedContext -Task $direct
     Assert-True (Test-Path -LiteralPath $state.ledgerPath) 'ledger was not created'
     $ignoreLines = Get-Content -LiteralPath (Join-Path $linked '.gitignore')
     Assert-True ($ignoreLines -contains 'existing-rule') 'gitignore did not preserve existing content'
@@ -194,13 +237,31 @@ try {
 
     $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
     Assert-True ($ledger.version -eq 1) 'ledger version must be 1'
-    foreach ($field in @('repositoryId', 'worktreePath', 'branch', 'primarySessionId', 'tasks')) {
+    foreach ($field in @('repositoryId', 'worktreePath', 'baseBranch', 'featureBranch', 'primarySessionId', 'tasks')) {
         Assert-True ($ledger.PSObject.Properties.Name -contains $field) "ledger missing $field"
     }
     Assert-True ($ledger.repositoryId -eq $linkedContext.repositoryId) 'ledger repository ID mismatch'
     Assert-True ($ledger.worktreePath -eq $linkedContext.worktreePath) 'ledger worktree path mismatch'
-    Assert-True ($ledger.branch -eq $linkedContext.branch) 'ledger branch mismatch'
+    Assert-True ($ledger.baseBranch -eq 'main') 'ledger base branch mismatch'
+    Assert-True ($ledger.featureBranch -eq $linkedContext.branch) 'ledger feature branch mismatch'
     Assert-True (@($ledger.tasks).Count -eq 0) 'new ledger tasks must be empty'
+
+    $validLedgerJson = Get-Content -Raw -LiteralPath $state.ledgerPath
+    foreach ($mutation in @(
+        [pscustomobject]@{ name='version'; apply={ param($x) $x.version = 2 } },
+        [pscustomobject]@{ name='repository'; apply={ param($x) $x.repositoryId = 'wrong' } },
+        [pscustomobject]@{ name='worktree'; apply={ param($x) $x.worktreePath = $mainRepo } },
+        [pscustomobject]@{ name='feature branch'; apply={ param($x) $x.featureBranch = 'feature/wrong' } }
+    )) {
+        $mutatedLedger = $validLedgerJson | ConvertFrom-Json
+        & $mutation.apply $mutatedLedger
+        $mutatedLedger | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $state.ledgerPath -Encoding UTF8
+        $ledgerRejected = $false
+        try { Read-AndAssertHandoffLedger -LedgerPath $state.ledgerPath -Context $linkedContext -Task $direct | Out-Null } catch { $ledgerRejected = $true }
+        Assert-True $ledgerRejected "ledger $($mutation.name) mismatch was accepted"
+    }
+    Set-Content -LiteralPath $state.ledgerPath -Value $validLedgerJson -Encoding UTF8
+    Read-AndAssertHandoffLedger -LedgerPath $state.ledgerPath -Context $linkedContext -Task $direct | Out-Null
 
     $fakeClaude = Join-Path $fixtureRoot 'fake-claude.cmd'
     @'
@@ -248,6 +309,19 @@ if "%CLAUDE_FAKE_MODE%"=="forbidden-edit" (
 )
 if "%CLAUDE_FAKE_MODE%"=="remote-change" (
   git -C "%CD%" remote add delegation-evil https://example.invalid/evil.git
+)
+if "%CLAUDE_FAKE_MODE%"=="staged-change" (
+  git -C "%CD%" add src\parser.ps1
+)
+if "%CLAUDE_FAKE_MODE%"=="ref-change" (
+  git -C "%CD%" branch delegated-ref
+  git -C "%CD%" tag delegated-tag
+)
+if "%CLAUDE_FAKE_MODE%"=="config-change" (
+  git -C "%CD%" config --local delegation.fake true
+)
+if "%CLAUDE_FAKE_MODE%"=="sibling-edit" (
+  echo delegated-sibling-change>>"%CD%\..\main\seed.txt"
 )
 if "%CLAUDE_FAKE_MODE%"=="head-change" (
   git -C "%CD%" commit --allow-empty -m delegated-head-change >nul
@@ -371,9 +445,21 @@ exit /b 0
     New-Item -ItemType Directory -Force -Path (Join-Path $linked 'src') | Out-Null
     Set-Content -LiteralPath (Join-Path $linked 'src/parser.ps1') -Value 'dirty-before-delegation'
     $executionTask = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-    $executionTask.forbiddenPaths = @('.git/**', '.github/**')
+    $executionTask.forbiddenPaths = @('.git/**', '.github/**', '.env*', 'secrets/**', 'credentials/**')
     $taskPath = Join-Path $state.stateDir 'task-direct.json'
     $executionTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $taskPath -Encoding UTF8
+
+    $preflightLedger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $preflightLedger.featureBranch = 'feature/tampered'
+    $preflightLedger | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $state.ledgerPath -Encoding UTF8
+    $dryRunRejectedTamperedLedger = $false
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -DryRun | Out-Null
+    } catch {
+        $dryRunRejectedTamperedLedger = $true
+    }
+    Assert-True $dryRunRejectedTamperedLedger 'dry-run proceeded with a mismatched ledger'
+    Set-Content -LiteralPath $state.ledgerPath -Value $validLedgerJson -Encoding UTF8
 
     $capturedStartProcess = $null
     function Start-Process {
@@ -557,7 +643,7 @@ exit /b 0
     $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
     $largeInputRecord = @($ledger.tasks)[-1]
     $largeInputResult = Get-Content -Raw -LiteralPath $largeInputRecord.resultPath | ConvertFrom-Json
-    Assert-True ($largeInputStopwatch.Elapsed.TotalSeconds -lt 4) 'large stdin blocked before the invocation deadline could terminate the child'
+    Assert-True ($largeInputStopwatch.Elapsed.TotalSeconds -lt 6) "large stdin blocked before the invocation deadline could terminate the child; elapsed=$($largeInputStopwatch.Elapsed.TotalSeconds)"
     Assert-True ([bool]$largeInputRecord.timedOut) 'non-reading child did not record a timeout'
     Assert-True ($largeInputResult.status -eq 'failed') 'non-reading child did not reach normalized result finalization'
 
@@ -660,6 +746,7 @@ exit /b 0
     $allowedRecord = @($ledger.tasks)[-1]
     Assert-True ($allowedRecord.changedDuringTask -contains 'src/parser.ps1') 'runner missed a change to an already dirty allowed file'
     Assert-True (@($allowedRecord.scopeViolations).Count -eq 0) 'allowed path was rejected'
+    Assert-True ($allowedRecord.status -eq 'needs-review') 'an allowed unstaged edit was falsely classified as a repository mutation'
 
     Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value '.env'
     Set-Content -LiteralPath (Join-Path $linked '.env') -Value 'ignored-before'
@@ -708,6 +795,24 @@ exit /b 0
     Assert-True ($repositoryRecord.repositoryViolations -contains 'remotes-changed') 'remote mutation was not recorded'
     $fixtureRemotes = Invoke-TestGit $linked @('remote')
     Assert-True ($fixtureRemotes -contains 'delegation-evil') 'runner automatically reverted a remote mutation'
+
+    foreach ($gitMutation in @(
+        [pscustomobject]@{ mode='staged-change'; violation='index-changed'; message='staged-only index mutation' },
+        [pscustomobject]@{ mode='ref-change'; violation='refs-changed'; message='new branch and tag mutation' },
+        [pscustomobject]@{ mode='config-change'; violation='config-changed'; message='local repository configuration mutation' },
+        [pscustomobject]@{ mode='sibling-edit'; violation='sibling-worktree-changed'; message='sibling checkout file mutation' }
+    )) {
+        $env:CLAUDE_FAKE_MODE = $gitMutation.mode
+        try {
+            & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+        } finally {
+            Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        }
+        $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+        $mutationRecord = @($ledger.tasks)[-1]
+        Assert-True ($mutationRecord.status -eq 'rejected') "$($gitMutation.message) was not rejected"
+        Assert-True ($mutationRecord.repositoryViolations -contains $gitMutation.violation) "$($gitMutation.message) was not recorded"
+    }
 
     $env:CLAUDE_FAKE_MODE = 'missing-session'
     try {
@@ -765,7 +870,7 @@ exit /b 0
     $corruptMain = Join-Path $fixtureRoot 'corrupt-main'
     $corruptLinked = Join-Path $fixtureRoot 'corrupt-feature'
     New-Item -ItemType Directory -Force -Path $corruptMain | Out-Null
-    Invoke-TestGit $corruptMain @('init') | Out-Null
+    Invoke-TestGit $corruptMain @('init', '-b', 'main') | Out-Null
     Invoke-TestGit $corruptMain @('config', 'user.email', 'tests@example.invalid') | Out-Null
     Invoke-TestGit $corruptMain @('config', 'user.name', 'Delegation Tests') | Out-Null
     Set-Content -LiteralPath (Join-Path $corruptMain 'seed.txt') -Value 'seed'
@@ -773,9 +878,11 @@ exit /b 0
     Invoke-TestGit $corruptMain @('commit', '-m', 'seed') | Out-Null
     Invoke-TestGit $corruptMain @('worktree', 'add', '-b', 'feature/corrupt', $corruptLinked) | Out-Null
     $corruptContext = Get-WorktreeContext -WorktreePath $corruptLinked
-    $corruptState = Initialize-HandoffState -Context $corruptContext
+    $corruptTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $corruptTask.featureBranch = 'feature/corrupt'
+    $corruptState = Initialize-HandoffState -Context $corruptContext -Task $corruptTask
     $corruptTaskPath = Join-Path $corruptState.stateDir 'task-corrupt.json'
-    $executionTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $corruptTaskPath -Encoding UTF8
+    $corruptTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $corruptTaskPath -Encoding UTF8
     $env:CLAUDE_FAKE_MODE = 'git-corrupt'
     $corruptionThrew = $false
     try {

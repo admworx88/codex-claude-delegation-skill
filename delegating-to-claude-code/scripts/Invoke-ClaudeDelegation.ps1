@@ -17,24 +17,29 @@ function Invoke-Git([string]$Path, [string[]]$Arguments) {
 
 function Resolve-AbsolutePath([string]$Path) {
     if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
-    return (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+    return (Get-Item -LiteralPath (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path -Force -ErrorAction Stop).FullName.TrimEnd('\', '/')
 }
 
 function Get-WorktreeContext([string]$WorktreePath) {
     $resolved = Resolve-AbsolutePath $WorktreePath
-    $gitDir = Invoke-Git $resolved @('rev-parse', '--absolute-git-dir')
+    $topLevel = Resolve-AbsolutePath (Invoke-Git $resolved @('rev-parse', '--show-toplevel'))
+    if (-not $resolved.Equals($topLevel, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "WorktreePath must be the linked worktree root: $topLevel"
+    }
+    $gitDir = Resolve-AbsolutePath (Invoke-Git $topLevel @('rev-parse', '--absolute-git-dir'))
     $commonDirRaw = Invoke-Git $resolved @('rev-parse', '--git-common-dir')
-    $commonDir = if ([System.IO.Path]::IsPathRooted($commonDirRaw)) {
+    $commonDirCandidate = if ([System.IO.Path]::IsPathRooted($commonDirRaw)) {
         [System.IO.Path]::GetFullPath($commonDirRaw)
     } else {
-        [System.IO.Path]::GetFullPath((Join-Path $resolved $commonDirRaw))
+        [System.IO.Path]::GetFullPath((Join-Path $topLevel $commonDirRaw))
     }
+    $commonDir = Resolve-AbsolutePath $commonDirCandidate
     [pscustomobject]@{
-        worktreePath = $resolved
-        gitDir = [System.IO.Path]::GetFullPath($gitDir)
+        worktreePath = $topLevel
+        gitDir = $gitDir
         commonDir = $commonDir
-        branch = Invoke-Git $resolved @('branch', '--show-current')
-        repositoryId = Invoke-Git $resolved @('rev-parse', '--show-toplevel')
+        branch = Invoke-Git $topLevel @('branch', '--show-current')
+        repositoryId = $commonDir
     }
 }
 
@@ -43,7 +48,8 @@ function Assert-LinkedWorktree($Context) {
     if ([string]::IsNullOrWhiteSpace($Context.branch)) { throw 'Detached HEAD is not allowed.' }
 }
 
-function Initialize-HandoffState($Context) {
+function Initialize-HandoffState($Context, $Task) {
+    if ($null -eq $Task) { throw 'A validated task packet is required to initialize handoff state.' }
     $stateDir = Join-Path $Context.worktreePath '.codex/claude-handoff'
     New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
     $ignorePath = Join-Path $Context.worktreePath '.gitignore'
@@ -56,11 +62,13 @@ function Initialize-HandoffState($Context) {
             version = 1
             repositoryId = $Context.repositoryId
             worktreePath = $Context.worktreePath
-            branch = $Context.branch
+            baseBranch = $Task.baseBranch
+            featureBranch = $Task.featureBranch
             primarySessionId = $null
             tasks = @()
         } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ledgerPath -Encoding UTF8
     }
+    Read-AndAssertHandoffLedger -LedgerPath $ledgerPath -Context $Context -Task $Task | Out-Null
     [pscustomobject]@{
         stateDir = $stateDir
         ledgerPath = $ledgerPath
@@ -71,11 +79,89 @@ function Initialize-HandoffState($Context) {
 function Read-TaskPacket([string]$Path) {
     $resolved = Resolve-AbsolutePath $Path
     $task = Get-Content -Raw -LiteralPath $resolved | ConvertFrom-Json
-    foreach ($name in @('id', 'goal', 'mode', 'allowedPaths', 'forbiddenPaths', 'forbiddenActions', 'context', 'acceptanceCriteria', 'requiredVerification', 'limits')) {
+    foreach ($name in @('id', 'goal', 'mode', 'baseBranch', 'featureBranch', 'allowedPaths', 'forbiddenPaths', 'forbiddenActions', 'context', 'acceptanceCriteria', 'requiredVerification', 'limits')) {
         if ($null -eq $task.$name) { throw "Task packet missing required field: $name" }
     }
     Assert-DelegationPolicy -Task $task
     return $task
+}
+
+function Read-AndAssertHandoffLedger([string]$LedgerPath, $Context, $Task) {
+    try {
+        $ledger = Get-Content -Raw -LiteralPath $LedgerPath -ErrorAction Stop | ConvertFrom-Json
+    } catch {
+        throw "Handoff ledger is not valid JSON: $LedgerPath"
+    }
+    $required = @('version', 'repositoryId', 'worktreePath', 'baseBranch', 'featureBranch', 'primarySessionId', 'tasks')
+    $names = @($ledger.PSObject.Properties.Name)
+    if (@($required | Where-Object { $names -notcontains $_ }).Count -gt 0 -or
+        @($names | Where-Object { $required -notcontains $_ }).Count -gt 0) {
+        throw 'Handoff ledger has an invalid shape.'
+    }
+    if ($ledger.version -isnot [int] -or $ledger.version -ne 1) { throw 'Unsupported handoff ledger version.' }
+    if (-not (Test-NonEmptyString $ledger.repositoryId) -or
+        -not ([string]$ledger.repositoryId).Equals($Context.repositoryId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Handoff ledger repository identity does not match the linked worktree.'
+    }
+    if (-not (Test-NonEmptyString $ledger.worktreePath)) { throw 'Handoff ledger worktreePath is invalid.' }
+    $ledgerWorktree = Resolve-AbsolutePath ([string]$ledger.worktreePath)
+    if (-not $ledgerWorktree.Equals($Context.worktreePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Handoff ledger worktree identity does not match the linked worktree.'
+    }
+    if (-not (Test-NonEmptyString $ledger.baseBranch) -or [string]$ledger.baseBranch -cne [string]$Task.baseBranch) {
+        throw 'Handoff ledger baseBranch does not match the task packet.'
+    }
+    if (-not (Test-NonEmptyString $ledger.featureBranch) -or
+        [string]$ledger.featureBranch -cne [string]$Task.featureBranch -or
+        [string]$ledger.featureBranch -cne [string]$Context.branch) {
+        throw 'Handoff ledger featureBranch does not match the task packet and current branch.'
+    }
+    if ($null -ne $ledger.primarySessionId -and -not (Test-NonEmptyString $ledger.primarySessionId)) {
+        throw 'Handoff ledger primarySessionId must be null or a non-empty string.'
+    }
+    if (-not ($ledger.tasks -is [System.Array])) { throw 'Handoff ledger tasks must be an array.' }
+    Invoke-Git $Context.worktreePath @('show-ref', '--verify', '--quiet', "refs/heads/$($ledger.baseBranch)") | Out-Null
+    return $ledger
+}
+
+function Test-NonEmptyString([object]$Value) {
+    return $Value -is [string] -and -not [string]::IsNullOrWhiteSpace([string]$Value)
+}
+
+function Assert-StringArray($Value, [string]$Name, [bool]$AllowEmpty = $false) {
+    if (-not ($Value -is [System.Array])) { throw "$Name must be an array." }
+    if (-not $AllowEmpty -and @($Value).Count -eq 0) { throw "$Name must not be empty." }
+    foreach ($item in @($Value)) {
+        if (-not (Test-NonEmptyString $item)) { throw "$Name must contain only non-empty strings." }
+    }
+}
+
+function Assert-NormalizedRelativePattern([string]$Pattern, [string]$Name) {
+    if (-not (Test-NonEmptyString $Pattern)) { throw "$Name contains an empty path." }
+    if ([System.IO.Path]::IsPathRooted($Pattern) -or $Pattern -match '^[A-Za-z]:' -or $Pattern.StartsWith('/') -or $Pattern.StartsWith('\')) {
+        throw "$Name paths must be relative."
+    }
+    if ($Pattern -match '\\|//|(^|/)\.\.?($|/)' -or $Pattern.EndsWith('/') -or $Pattern -match '[:<>"|?\[\]]') {
+        throw "$Name contains a non-normalized path: $Pattern"
+    }
+    if ($Pattern -in @('*', '**') -or $Pattern -match '\*\*/.+' -or $Pattern -match '\*.+/') {
+        throw "$Name contains an unsafe or malformed wildcard: $Pattern"
+    }
+    if ($Pattern -match '\*' -and $Pattern -notmatch '(^|/)[^/]*\*$' -and $Pattern -notmatch '/\*\*$') {
+        throw "$Name contains an unsupported wildcard: $Pattern"
+    }
+    if ($Name -like 'allowedPaths*' -or $Name -like 'parallelWorkstreams*') {
+        if ($Pattern -match '\*' -and $Pattern -notmatch '/\*\*$') {
+            throw "$Name may use wildcards only as a final /** suffix."
+        }
+    }
+}
+
+function Test-PatternContainsPath([string]$Container, [string]$Candidate) {
+    $containerRoot = $Container.TrimEnd([char[]]@('*', '/'))
+    $candidateRoot = $Candidate.TrimEnd([char[]]@('*', '/'))
+    return $candidateRoot.Equals($containerRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+           $candidateRoot.StartsWith($containerRoot + '/', [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Test-PathPatternOverlap([string]$Left, [string]$Right) {
@@ -108,32 +194,104 @@ function Test-PositiveNumber($Value) {
 function Assert-TaskLimits($Limits) {
     if ($null -eq $Limits) { throw 'Task packet limits are required.' }
     $limitNames = $Limits.PSObject.Properties.Name
+    if (@($limitNames | Where-Object { $_ -notin @('maxTurns', 'timeoutSeconds', 'maxBudgetUsd') }).Count -gt 0) {
+        throw 'Task packet limits contain unsupported fields.'
+    }
     if ($limitNames -notcontains 'maxTurns' -or -not (Test-PositiveInteger $Limits.maxTurns)) {
         throw 'limits.maxTurns must be a positive integer.'
     }
     if ($limitNames -notcontains 'timeoutSeconds' -or -not (Test-PositiveNumber $Limits.timeoutSeconds)) {
         throw 'limits.timeoutSeconds must be positive.'
     }
-    if ($limitNames -contains 'maxBudgetUsd' -and -not (Test-NonNegativeNumber $Limits.maxBudgetUsd)) {
-        throw 'limits.maxBudgetUsd must be non-negative when provided.'
+    if ($limitNames -notcontains 'maxBudgetUsd' -or -not (Test-PositiveNumber $Limits.maxBudgetUsd)) {
+        throw 'limits.maxBudgetUsd must be positive.'
     }
 }
 
 function Assert-DelegationPolicy($Task) {
+    $commonProperties = @(
+        'id', 'goal', 'mode', 'baseBranch', 'featureBranch', 'allowedPaths',
+        'forbiddenPaths', 'forbiddenActions', 'context', 'acceptanceCriteria',
+        'requiredVerification', 'limits'
+    )
+    $allowedProperties = $commonProperties + @('parallelWorkstreams', 'parallelismJustification')
+    foreach ($property in $Task.PSObject.Properties.Name) {
+        if ($allowedProperties -notcontains $property) { throw "Unsupported task packet field: $property" }
+    }
+    foreach ($name in @('id', 'goal', 'baseBranch', 'featureBranch')) {
+        if (-not (Test-NonEmptyString $Task.$name)) { throw "$name must be a non-empty string." }
+    }
+    if ([string]$Task.baseBranch -eq [string]$Task.featureBranch) {
+        throw 'baseBranch and featureBranch must be different.'
+    }
     if (@('direct', 'subagents', 'agent-team') -notcontains $Task.mode) { throw "Unsupported mode: $($Task.mode)" }
+    Assert-StringArray -Value $Task.allowedPaths -Name 'allowedPaths'
+    Assert-StringArray -Value $Task.forbiddenPaths -Name 'forbiddenPaths'
+    Assert-StringArray -Value $Task.forbiddenActions -Name 'forbiddenActions'
+    Assert-StringArray -Value $Task.context -Name 'context' -AllowEmpty $true
+    Assert-StringArray -Value $Task.acceptanceCriteria -Name 'acceptanceCriteria'
+    Assert-StringArray -Value $Task.requiredVerification -Name 'requiredVerification'
+    foreach ($path in @($Task.allowedPaths)) { Assert-NormalizedRelativePattern -Pattern $path -Name 'allowedPaths' }
+    foreach ($path in @($Task.forbiddenPaths)) { Assert-NormalizedRelativePattern -Pattern $path -Name 'forbiddenPaths' }
+    if (@($Task.allowedPaths | Where-Object { $_ -in @('.git', '.git/**') }).Count -gt 0) {
+        throw 'allowedPaths must not authorize Git metadata.'
+    }
+    if (-not (@($Task.forbiddenPaths) -contains '.git/**')) {
+        throw 'forbiddenPaths must include .git/**.'
+    }
+    if (@($Task.forbiddenPaths | Where-Object { $_ -match '(?i)(^|/)(\.env|[^/]*(secret|credential))' }).Count -eq 0) {
+        throw 'forbiddenPaths must prohibit sensitive or credential files.'
+    }
+    $normalizedActions = @($Task.forbiddenActions | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+    foreach ($operation in @('commit', 'push', 'pull', 'fetch', 'merge', 'rebase', 'reset', 'checkout', 'switch', 'stash', 'tag', 'remote', 'worktree')) {
+        if (@($normalizedActions | Where-Object { $_ -match "(^|\s)git(?:\.exe)?\s+.*\b$operation\b" }).Count -eq 0) {
+            throw "forbiddenActions must prohibit git $operation."
+        }
+    }
+    foreach ($sensitiveTerm in @('secret', 'credential')) {
+        if (@($normalizedActions | Where-Object { $_ -match $sensitiveTerm }).Count -eq 0) {
+            throw "forbiddenActions must prohibit access to $sensitiveTerm data."
+        }
+    }
     Assert-TaskLimits $Task.limits
-    if ($Task.mode -ne 'agent-team') { return }
+    if ($Task.mode -ne 'agent-team') {
+        if ($Task.PSObject.Properties.Name -contains 'parallelWorkstreams') {
+            throw 'parallelWorkstreams is allowed only for agent-team mode.'
+        }
+        if ($Task.PSObject.Properties.Name -contains 'parallelismJustification') {
+            throw 'parallelismJustification is allowed only for agent-team mode.'
+        }
+        return
+    }
 
     $workstreams = @($Task.parallelWorkstreams)
     if ($workstreams.Count -lt 2) { throw 'Agent-team mode requires at least two workstreams.' }
+    if ($workstreams.Count -gt 3 -and (
+        $Task.PSObject.Properties.Name -notcontains 'parallelismJustification' -or
+        -not (Test-NonEmptyString $Task.parallelismJustification)
+    )) {
+        throw 'Agent-team mode with more than three workstreams requires parallelismJustification.'
+    }
+    $names = @()
     for ($i = 0; $i -lt $workstreams.Count; $i++) {
-        if ($null -eq $workstreams[$i].ownedPaths -or @($workstreams[$i].ownedPaths).Count -eq 0) {
-            throw "Agent-team workstream $i must declare ownedPaths."
+        $stream = $workstreams[$i]
+        if ($null -eq $stream -or @($stream.PSObject.Properties.Name | Where-Object { $_ -notin @('name', 'ownedPaths') }).Count -gt 0) {
+            throw "Agent-team workstream $i has an invalid shape."
+        }
+        if (-not (Test-NonEmptyString $stream.name)) { throw "Agent-team workstream $i must have a non-empty name." }
+        if ($names -contains ([string]$stream.name).ToLowerInvariant()) { throw "Duplicate workstream name: $($stream.name)" }
+        $names += ([string]$stream.name).ToLowerInvariant()
+        Assert-StringArray -Value $stream.ownedPaths -Name "parallelWorkstreams[$i].ownedPaths"
+        foreach ($ownedPath in @($stream.ownedPaths)) {
+            Assert-NormalizedRelativePattern -Pattern $ownedPath -Name "parallelWorkstreams[$i].ownedPaths"
+            if (@($Task.allowedPaths | Where-Object { Test-PatternContainsPath -Container $_ -Candidate $ownedPath }).Count -eq 0) {
+                throw "Workstream-owned path is outside allowedPaths: $ownedPath"
+            }
+            if (@($Task.forbiddenPaths | Where-Object { Test-PathPatternOverlap $_ $ownedPath }).Count -gt 0) {
+                throw "Workstream-owned path overlaps forbiddenPaths: $ownedPath"
+            }
         }
         for ($j = $i + 1; $j -lt $workstreams.Count; $j++) {
-            if ($null -eq $workstreams[$j].ownedPaths -or @($workstreams[$j].ownedPaths).Count -eq 0) {
-                throw "Agent-team workstream $j must declare ownedPaths."
-            }
             foreach ($left in $workstreams[$i].ownedPaths) {
                 foreach ($right in $workstreams[$j].ownedPaths) {
                     if (Test-PathPatternOverlap $left $right) { throw "Overlapping ownership: $left and $right" }
@@ -181,12 +339,14 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
     $args = @('-p', '--dangerously-skip-permissions', '--output-format', 'json',
               '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
     $args += '--disallowedTools'
-    $args += @(
+    $bashGitDenials = @(
         'Bash(git *)', 'Bash(git.exe *)',
         'Bash(* git *)', 'Bash(* git.exe *)',
         'Bash(*\git *)', 'Bash(*\git.exe *)',
         'Bash(*/git *)', 'Bash(*/git.exe *)'
     )
+    $args += $bashGitDenials
+    $args += @($bashGitDenials | ForEach-Object { $_ -replace '^Bash', 'PowerShell' })
 
     $environment = @{}
     $fresh = $Task.mode -eq 'agent-team'
@@ -316,6 +476,65 @@ function Get-WorktreeFingerprint([string]$Worktree) {
 function Compare-WorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
     $all = @($Before.Keys) + @($After.Keys) | Sort-Object -Unique
     return @($all | Where-Object { $Before[$_] -ne $After[$_] })
+}
+
+function Get-FileIdentity([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '<missing>' }
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+}
+
+function ConvertTo-StableFingerprint([hashtable]$Fingerprint) {
+    return (($Fingerprint.Keys | Sort-Object | ForEach-Object { "$_=$($Fingerprint[$_])" }) -join "`n")
+}
+
+function Get-SiblingWorktreeFingerprint($Context) {
+    $siblings = @{}
+    $worktreeList = Invoke-Git $Context.worktreePath @('worktree', 'list', '--porcelain')
+    foreach ($line in @($worktreeList -split "`r?`n")) {
+        if (-not $line.StartsWith('worktree ')) { continue }
+        $path = Resolve-AbsolutePath $line.Substring(9)
+        if ($path.Equals($Context.worktreePath, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $siblings[$path.ToLowerInvariant()] = ConvertTo-StableFingerprint (Get-WorktreeFingerprint -Worktree $path)
+    }
+    return $siblings
+}
+
+function Compare-SiblingWorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
+    $all = @($Before.Keys) + @($After.Keys) | Sort-Object -Unique
+    return @($all | Where-Object { $Before[$_] -cne $After[$_] })
+}
+
+function Get-GitMetadataSnapshot($Context) {
+    $refs = @(Invoke-Git $Context.worktreePath @('for-each-ref', '--format=%(refname)%09%(objectname)%09%(symref)') -split "`r?`n" |
+        Where-Object { $_ -ne '' } | Sort-Object) -join "`n"
+    $remotes = @(Invoke-Git $Context.worktreePath @('remote', '-v') -split "`r?`n" |
+        Where-Object { $_ -ne '' } | Sort-Object) -join "`n"
+    [pscustomobject]@{
+        Head = Invoke-Git $Context.worktreePath @('rev-parse', 'HEAD')
+        Branch = Invoke-Git $Context.worktreePath @('branch', '--show-current')
+        Remotes = $remotes
+        Index = @(Invoke-Git $Context.worktreePath @('ls-files', '--stage') -split "`r?`n" |
+            Where-Object { $_ -ne '' } | Sort-Object) -join "`n"
+        Refs = $refs
+        RepositoryConfig = Get-FileIdentity (Join-Path $Context.commonDir 'config')
+        WorktreeConfig = Get-FileIdentity (Join-Path $Context.gitDir 'config.worktree')
+    }
+}
+
+function Get-GitMetadataProbe($Context) {
+    try {
+        return [pscustomobject]@{ Success = $true; Value = Get-GitMetadataSnapshot -Context $Context; Violation = $null }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Value = $null; Violation = 'git-metadata-probe-failed' }
+    }
+}
+
+function Get-SiblingFingerprintProbe($Context) {
+    try {
+        return [pscustomobject]@{ Success = $true; Value = Get-SiblingWorktreeFingerprint -Context $Context; Violation = $null }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Value = $null; Violation = 'sibling-worktree-probe-failed' }
+    }
 }
 
 function Get-ScopeViolations([string[]]$ChangedPaths, $Task) {
@@ -678,11 +897,13 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
 
         $startedAt = [DateTimeOffset]::UtcNow.ToString('o')
         $startingStatus = Invoke-Git $Context.worktreePath @('status', '--porcelain=v1')
-        $startingHead = Invoke-Git $Context.worktreePath @('rev-parse', 'HEAD')
-        $startingBranch = Invoke-Git $Context.worktreePath @('branch', '--show-current')
+        $startingMetadata = Get-GitMetadataSnapshot -Context $Context
+        $startingHead = $startingMetadata.Head
+        $startingBranch = $startingMetadata.Branch
         $startingRemotes = Invoke-Git $Context.worktreePath @('remote', '-v')
+        $startingSiblings = Get-SiblingWorktreeFingerprint -Context $Context
         $beforeFingerprint = Get-WorktreeFingerprint -Worktree $Context.worktreePath
-        $ledger = Get-Content -Raw -LiteralPath $State.ledgerPath | ConvertFrom-Json
+        $ledger = Read-AndAssertHandoffLedger -LedgerPath $State.ledgerPath -Context $Context -Task $Task
         $sessionId = if ($Task.mode -eq 'agent-team') { $null } else { [string]$ledger.primarySessionId }
         $resolvedClaudeCommand = Resolve-ClaudeCommandPath -Command $ClaudeCommand
         $supportsForwarding = Get-ClaudeVersionSupport -ClaudeCommand $resolvedClaudeCommand
@@ -728,6 +949,8 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         $endingBranchProbe = Get-GitProbe -Worktree $Context.worktreePath -Arguments @('branch', '--show-current') -Name 'branch'
         $endingRemotesProbe = Get-GitProbe -Worktree $Context.worktreePath -Arguments @('remote', '-v') -Name 'remotes'
         $endingStatusProbe = Get-GitProbe -Worktree $Context.worktreePath -Arguments @('status', '--porcelain=v1') -Name 'status'
+        $endingMetadataProbe = Get-GitMetadataProbe -Context $Context
+        $endingSiblingsProbe = Get-SiblingFingerprintProbe -Context $Context
         $afterFingerprintProbe = Get-FingerprintProbe -Worktree $Context.worktreePath
         $changedDuringTask = if ($afterFingerprintProbe.Success) {
             Compare-WorktreeFingerprint -Before $beforeFingerprint -After $afterFingerprintProbe.Value
@@ -736,12 +959,25 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         }
         $scopeViolations = Get-ScopeViolations -ChangedPaths $changedDuringTask -Task $Task
         $repositoryViolations = @()
-        foreach ($probe in @($endingHeadProbe, $endingBranchProbe, $endingRemotesProbe, $endingStatusProbe, $afterFingerprintProbe)) {
+        foreach ($probe in @($endingHeadProbe, $endingBranchProbe, $endingRemotesProbe, $endingStatusProbe, $endingMetadataProbe, $endingSiblingsProbe, $afterFingerprintProbe)) {
             if (-not $probe.Success) { $repositoryViolations += $probe.Violation }
         }
         if ($endingHeadProbe.Success -and $startingHead -ne $endingHeadProbe.Value) { $repositoryViolations += 'head-changed' }
         if ($endingBranchProbe.Success -and $startingBranch -ne $endingBranchProbe.Value) { $repositoryViolations += 'branch-changed' }
         if ($endingRemotesProbe.Success -and $startingRemotes -ne $endingRemotesProbe.Value) { $repositoryViolations += 'remotes-changed' }
+        if ($endingMetadataProbe.Success) {
+            if ($startingMetadata.Index -cne $endingMetadataProbe.Value.Index) { $repositoryViolations += 'index-changed' }
+            if ($startingMetadata.Refs -cne $endingMetadataProbe.Value.Refs) { $repositoryViolations += 'refs-changed' }
+            if ($startingMetadata.RepositoryConfig -cne $endingMetadataProbe.Value.RepositoryConfig -or
+                $startingMetadata.WorktreeConfig -cne $endingMetadataProbe.Value.WorktreeConfig) {
+                $repositoryViolations += 'config-changed'
+            }
+        }
+        if ($endingSiblingsProbe.Success -and
+            @(Compare-SiblingWorktreeFingerprint -Before $startingSiblings -After $endingSiblingsProbe.Value).Count -gt 0) {
+            $repositoryViolations += 'sibling-worktree-changed'
+        }
+        $repositoryViolations = @($repositoryViolations | Sort-Object -Unique)
         $reviewStatus = if (@($scopeViolations).Count -gt 0 -or @($repositoryViolations).Count -gt 0) {
             'rejected'
         } else {
@@ -789,13 +1025,19 @@ if (-not $LibraryMode) {
     }
     $context = Get-WorktreeContext -WorktreePath $WorktreePath
     Assert-LinkedWorktree -Context $context
-    $state = Initialize-HandoffState -Context $context
     $resolvedTask = Resolve-AbsolutePath $TaskPacketPath
-    $statePrefix = $state.stateDir.TrimEnd('\') + '\'
+    $expectedStateDir = Join-Path $context.worktreePath '.codex/claude-handoff'
+    $statePrefix = $expectedStateDir.TrimEnd('\') + '\'
     if (-not $resolvedTask.StartsWith($statePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw 'Task packet must be stored inside .codex/claude-handoff/.'
     }
     $task = Read-TaskPacket -Path $resolvedTask
+    if ([string]$task.featureBranch -cne [string]$context.branch) {
+        throw 'Task packet featureBranch must match the current linked-worktree branch.'
+    }
+    Invoke-Git $context.worktreePath @('show-ref', '--verify', '--quiet', "refs/heads/$($task.baseBranch)") | Out-Null
+    $state = Initialize-HandoffState -Context $context -Task $task
+    Read-AndAssertHandoffLedger -LedgerPath $state.ledgerPath -Context $context -Task $task | Out-Null
     if ($DryRun) {
         New-ClaudeInvocation -Task $task -SessionId $null -SupportsForwarding $true | ConvertTo-Json -Depth 8
         return

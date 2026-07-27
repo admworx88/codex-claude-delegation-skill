@@ -80,10 +80,17 @@ dependent or overlapping work remains sequential.
 
 ## Worktree and local ledger
 
-The guarded runner refuses the repository's main checkout and validates the
-repository, worktree, branch, and task packet before launching Claude. It also
-prevents concurrent top-level Claude tasks in the same worktree and checks
-HEAD, branch, remotes, file changes, and forbidden paths after execution.
+The guarded runner refuses the repository's main checkout, requires the exact
+canonical linked-worktree root, and validates repository/worktree identity,
+base and feature branches, the ledger, and the task packet before dry-run or
+launch. It prevents concurrent top-level tasks and compares sibling worktrees,
+the Git index, all refs, repository/worktree configuration, HEAD, branch,
+remotes, file changes, and forbidden paths after execution.
+
+Task packets use normalized relative paths, positive turn/time/budget limits,
+the complete Git prohibition set, and explicit secret/credential
+prohibitions. Agent teams are limited to three workstreams unless the packet
+explicitly justifies a larger bounded team.
 
 Each feature keeps durable handoff state under:
 

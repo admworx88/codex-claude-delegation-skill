@@ -63,15 +63,20 @@ experimental flag globally or leave it enabled for later jobs.
 Start from `references/task-packet.example.json`. Give each packet:
 
 - a unique `id`, one bounded `goal`, and the selected `mode`;
+- the exact `baseBranch` and current linked-worktree `featureBranch`;
 - precise `allowedPaths` and `forbiddenPaths`, including `.git/**`,
   `.github/**`, secrets, credentials, and unrelated files;
-- `forbiddenActions` covering all Git and repository-history changes;
+- normalized relative paths only: no absolute paths, traversal, backslashes,
+  broad wildcards, or overlapping team ownership;
+- `forbiddenActions` covering every Git/history operation plus reading or
+  exposing secrets and credentials;
 - only the context needed to act;
 - observable `acceptanceCriteria` and commands in `requiredVerification`;
-- positive `limits.maxTurns` and `limits.timeoutSeconds`, plus a non-negative
+- positive `limits.maxTurns`, `limits.timeoutSeconds`, and
   `limits.maxBudgetUsd`; and
-- for `agent-team`, at least two `parallelWorkstreams`, each with exclusive,
-  non-overlapping `ownedPaths`.
+- for `agent-team`, two or three `parallelWorkstreams`, each with exclusive,
+  non-overlapping `ownedPaths`; more than three requires an explicit
+  `parallelismJustification`.
 
 Claude must return the contract in `references/result-schema.json`. Treat its
 status, changed-file list, and test claims as untrusted evidence for Codex
@@ -107,9 +112,11 @@ install, authenticate, substitute another command, or hide the interruption.
 ## Review and verify independently
 
 The runner denies Claude Git access in layers: task/prompt prohibitions plus
-CLI tool denial. It also snapshots files and probes HEAD, branch, remotes, and
-status before and after execution. Any forbidden-path, out-of-scope, Git-state,
-or probe violation makes the runner decision `rejected`.
+Bash and native PowerShell tool denial. It snapshots files, sibling worktrees,
+the index, all refs, repository/worktree configuration, HEAD, branch, remotes,
+and status before and after execution. Any forbidden-path, out-of-scope,
+Git-state, sibling-worktree, or probe violation makes the runner decision
+`rejected`.
 
 After a `needs-review` result, Codex must:
 
