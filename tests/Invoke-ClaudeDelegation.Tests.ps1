@@ -48,6 +48,53 @@ Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComp
 Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
 Assert-True (-not (Test-CanonicalPathEqual -Left '/Users/delegation/Task.json' -Right '/Users/delegation/task.json' -Platform 'MacOS')) 'macOS canonical paths must compare case-sensitively'
 
+$macFingerprintRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-delegation-macos-fingerprint-' + [guid]::NewGuid())
+$originalGetDelegationPlatform = ${function:Get-DelegationPlatform}
+$originalInvokeGit = ${function:Invoke-Git}
+$originalResolveAbsolutePath = ${function:Resolve-AbsolutePath}
+$originalGetWorktreeFingerprint = ${function:Get-WorktreeFingerprint}
+try {
+    Set-Item Function:\Get-DelegationPlatform -Value { return 'MacOS' }
+    New-Item -ItemType Directory -Path $macFingerprintRoot | Out-Null
+
+    $macPrimaryFingerprint = Get-WorktreeFingerprint -Worktree $macFingerprintRoot
+    $macPrimaryFingerprint['Foo.txt'] = 'upper'
+    $macPrimaryFingerprint['foo.txt'] = 'lower'
+    Assert-True ($macPrimaryFingerprint.Count -eq 2) 'macOS primary fingerprint collapsed paths that differ only by case'
+
+    $emptyMacPrimaryFingerprint = [System.Collections.Hashtable]::new([System.StringComparer]::Ordinal)
+    $macPrimaryChanges = Compare-WorktreeFingerprint -Before $emptyMacPrimaryFingerprint -After $macPrimaryFingerprint
+    Assert-True (@($macPrimaryChanges).Count -eq 2) 'macOS primary fingerprint comparison collapsed case-distinct path keys'
+
+    Set-Item Function:\Invoke-Git -Value {
+        param([string]$Path, [string[]]$Arguments)
+        return "worktree /repo/primary`nworktree /repo/Foo`nworktree /repo/foo"
+    }
+    Set-Item Function:\Resolve-AbsolutePath -Value {
+        param([string]$Path)
+        return $Path
+    }
+    Set-Item Function:\Get-WorktreeFingerprint -Value {
+        param([string]$Worktree)
+        return @{ marker = $Worktree }
+    }
+    $macSiblingContext = [pscustomobject]@{ worktreePath = '/repo/primary' }
+    $macSiblingFingerprint = Get-SiblingWorktreeFingerprint -Context $macSiblingContext
+    Assert-True ($macSiblingFingerprint.Count -eq 2) 'macOS sibling fingerprint collapsed worktree paths that differ only by case'
+
+    $emptyMacSiblingFingerprint = [System.Collections.Hashtable]::new([System.StringComparer]::Ordinal)
+    $macSiblingChanges = Compare-SiblingWorktreeFingerprint -Before $emptyMacSiblingFingerprint -After $macSiblingFingerprint
+    Assert-True (@($macSiblingChanges).Count -eq 2) 'macOS sibling fingerprint comparison collapsed case-distinct path keys'
+} finally {
+    Set-Item Function:\Get-DelegationPlatform -Value $originalGetDelegationPlatform
+    Set-Item Function:\Invoke-Git -Value $originalInvokeGit
+    Set-Item Function:\Resolve-AbsolutePath -Value $originalResolveAbsolutePath
+    Set-Item Function:\Get-WorktreeFingerprint -Value $originalGetWorktreeFingerprint
+    if (Test-Path -LiteralPath $macFingerprintRoot) {
+        Remove-Item -LiteralPath $macFingerprintRoot -Recurse -Force
+    }
+}
+
 $parsedExample = Read-TaskPacket -Path $TaskExample
 Assert-True ($parsedExample.id -eq 'task-001') 'task packet reader did not return the parsed packet'
 

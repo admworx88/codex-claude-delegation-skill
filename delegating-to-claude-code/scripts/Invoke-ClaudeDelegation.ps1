@@ -43,6 +43,22 @@ function Test-CanonicalPathEqual([string]$Left, [string]$Right, [string]$Platfor
     return [string]::Equals($Left, $Right, (Get-PathStringComparison -Platform $Platform))
 }
 
+function New-PathIdentityMap([string]$Platform) {
+    $comparison = Get-PathStringComparison -Platform $Platform
+    $comparer = if ($comparison -eq [System.StringComparison]::OrdinalIgnoreCase) {
+        [System.StringComparer]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparer]::Ordinal
+    }
+    return [System.Collections.Hashtable]::new($comparer)
+}
+
+function Get-PathIdentityKeyUnion([hashtable]$Before, [hashtable]$After, [string]$Platform) {
+    $keys = New-PathIdentityMap -Platform $Platform
+    foreach ($key in @($Before.Keys) + @($After.Keys)) { $keys[$key] = $true }
+    return @($keys.Keys | Sort-Object)
+}
+
 function Get-WorktreeContext([string]$WorktreePath) {
     $resolved = Resolve-AbsolutePath $WorktreePath
     $topLevel = Resolve-AbsolutePath (Invoke-Git $resolved @('rev-parse', '--show-toplevel'))
@@ -473,7 +489,7 @@ function Exit-TaskLock($LockHandle) {
 }
 
 function Get-WorktreeFingerprint([string]$Worktree) {
-    $map = @{}
+    $map = New-PathIdentityMap -Platform (Get-DelegationPlatform)
     $root = Get-Item -LiteralPath $Worktree -ErrorAction Stop
     $rootPrefixLength = $root.FullName.TrimEnd('\', '/').Length + 1
     $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
@@ -503,7 +519,7 @@ function Get-WorktreeFingerprint([string]$Worktree) {
 }
 
 function Compare-WorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
-    $all = @($Before.Keys) + @($After.Keys) | Sort-Object -Unique
+    $all = Get-PathIdentityKeyUnion -Before $Before -After $After -Platform (Get-DelegationPlatform)
     return @($all | Where-Object { $Before[$_] -ne $After[$_] })
 }
 
@@ -517,13 +533,7 @@ function ConvertTo-StableFingerprint([hashtable]$Fingerprint) {
 }
 
 function Get-SiblingWorktreeFingerprint($Context) {
-    $comparison = Get-PathStringComparison -Platform (Get-DelegationPlatform)
-    $comparer = if ($comparison -eq [System.StringComparison]::OrdinalIgnoreCase) {
-        [System.StringComparer]::OrdinalIgnoreCase
-    } else {
-        [System.StringComparer]::Ordinal
-    }
-    $siblings = [System.Collections.Hashtable]::new($comparer)
+    $siblings = New-PathIdentityMap -Platform (Get-DelegationPlatform)
     $worktreeList = Invoke-Git $Context.worktreePath @('worktree', 'list', '--porcelain')
     foreach ($line in @($worktreeList -split "`r?`n")) {
         if (-not $line.StartsWith('worktree ')) { continue }
@@ -535,7 +545,7 @@ function Get-SiblingWorktreeFingerprint($Context) {
 }
 
 function Compare-SiblingWorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
-    $all = @($Before.Keys) + @($After.Keys) | Sort-Object -Unique
+    $all = Get-PathIdentityKeyUnion -Before $Before -After $After -Platform (Get-DelegationPlatform)
     return @($all | Where-Object { $Before[$_] -cne $After[$_] })
 }
 
