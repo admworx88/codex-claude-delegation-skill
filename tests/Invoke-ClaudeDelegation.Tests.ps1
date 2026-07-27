@@ -207,6 +207,10 @@ try {
 @echo off
 if not "%1"=="auth" goto version
 if not "%2"=="status" goto version
+if "%CLAUDE_FAKE_AUTH%"=="false" (
+  echo {"loggedIn":false}
+  exit /b 0
+)
 echo {"loggedIn":true}
 exit /b 0
 :version
@@ -225,12 +229,62 @@ if "%CLAUDE_FAKE_MODE%"=="timeout" (
 if "%CLAUDE_FAKE_MODE%"=="allowed-edit" (
   echo delegated-change>>"%CD%\src\parser.ps1"
 )
+if "%CLAUDE_FAKE_MODE%"=="ignored-edit" (
+  echo delegated-secret>>"%CD%\.env"
+)
 if "%CLAUDE_FAKE_MODE%"=="forbidden-edit" (
   if not exist "%CD%\.github\workflows" mkdir "%CD%\.github\workflows"
   echo forbidden>"%CD%\.github\workflows\ci.yml"
 )
 if "%CLAUDE_FAKE_MODE%"=="remote-change" (
   git -C "%CD%" remote add delegation-evil https://example.invalid/evil.git
+)
+if "%CLAUDE_FAKE_MODE%"=="head-change" (
+  git -C "%CD%" commit --allow-empty -m delegated-head-change >nul
+)
+if "%CLAUDE_FAKE_MODE%"=="branch-change" (
+  git -C "%CD%" checkout -b delegated-branch >nul
+)
+if "%CLAUDE_FAKE_MODE%"=="replace-lock" (
+  echo replacement-lock>"%CD%\.codex\claude-handoff\running.lock"
+)
+if "%CLAUDE_FAKE_MODE%"=="capture-environment" (
+  if defined CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS (echo %CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS%) else (echo ^<unset^>) >"%CD%\.codex\claude-handoff\child-team-env.txt"
+)
+if "%CLAUDE_FAKE_MODE%"=="capture-stdin" (
+  more >"%CD%\.codex\claude-handoff\captured-stdin.txt"
+)
+if "%CLAUDE_FAKE_MODE%"=="large" (
+  for /L %%A in (1,1,700) do <nul set /p "=0123456789"
+  echo.
+)
+if "%CLAUDE_FAKE_MODE%"=="mismatched-id" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"wrong-task","status":"completed","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="wrong-types" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"task-direct","status":"completed","summary":"done","changedFiles":"not-an-array","tests":[],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="bad-status" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"task-direct","status":"rejected","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="extra-field" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"task-direct","status":"completed","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[],"extra":"no"}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="invalid-test" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"task-direct","status":"completed","summary":"done","changedFiles":[],"tests":[{"command":"test","outcome":"unknown","extra":"no"}],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="nonzero" (
+  echo ordinary failure 1>&2
+  exit /b 7
+)
+if "%CLAUDE_FAKE_MODE%"=="git-corrupt" (
+  echo entered>"%CD%\.codex\claude-handoff\corrupt-entered.txt"
+  powershell -NoProfile -Command "$p = Join-Path (Get-Location) '.git'; [System.IO.File]::SetAttributes($p, [System.IO.FileAttributes]::Normal); [System.IO.File]::WriteAllText($p, 'gitdir: Z:\missing-delegation-gitdir')" 2>"%CD%\.codex\claude-handoff\corrupt-error.txt"
 )
 if not "%CLAUDE_FAKE_MODE%"=="missing-session" goto output
 if exist "%CD%\.codex\claude-handoff\missing-session-attempted" goto output
@@ -280,6 +334,64 @@ exit /b 0
     $taskPath = Join-Path $state.stateDir 'task-direct.json'
     $executionTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $taskPath -Encoding UTF8
 
+    $capturedStartProcess = $null
+    function Start-Process {
+        param(
+            [string]$FilePath,
+            [object[]]$ArgumentList,
+            [string]$WorkingDirectory
+        )
+        $script:capturedStartProcess = [pscustomobject]@{
+            FilePath = $FilePath
+            ArgumentList = $ArgumentList
+            WorkingDirectory = $WorkingDirectory
+        }
+    }
+    try {
+        $missingSetupRejected = $false
+        try {
+            & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand (Join-Path $fixtureRoot 'absent-claude.cmd') | Out-Null
+        } catch {
+            $missingSetupRejected = $true
+        }
+        Assert-True $missingSetupRejected 'missing Claude CLI did not require owner setup'
+        $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+        $missingWait = @($ledger.tasks)[-1]
+        Assert-True ($missingWait.status -eq 'waiting-for-owner') 'missing CLI did not append owner wait state'
+        Assert-True ($missingWait.reason -eq 'claude-cli-missing') 'missing CLI wait reason was incorrect'
+        Assert-True ((@($capturedStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'missing CLI setup received bypass permissions'
+
+        $env:CLAUDE_FAKE_AUTH = 'false'
+        $unauthenticatedRejected = $false
+        try {
+            & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+        } catch {
+            $unauthenticatedRejected = $true
+        } finally {
+            Remove-Item Env:\CLAUDE_FAKE_AUTH -ErrorAction SilentlyContinue
+        }
+        Assert-True $unauthenticatedRejected 'unauthenticated Claude CLI did not require owner setup'
+        $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+        $authenticationWait = @($ledger.tasks)[-1]
+        Assert-True ($authenticationWait.status -eq 'waiting-for-owner') 'unauthenticated CLI did not append owner wait state'
+        Assert-True ($authenticationWait.reason -eq 'claude-authentication-required') 'authentication wait reason was incorrect'
+        Assert-True ((@($capturedStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'authentication setup received bypass permissions'
+    } finally {
+        Remove-Item -Path Function:\Start-Process -Force
+    }
+
+    $namedFakeClaude = Join-Path $fixtureRoot 'fake-claude-name.cmd'
+    Copy-Item -LiteralPath $fakeClaude -Destination $namedFakeClaude
+    $savedPath = $env:PATH
+    $env:PATH = "$fixtureRoot;$savedPath"
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand 'fake-claude-name' | Out-Null
+    } finally {
+        $env:PATH = $savedPath
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    Assert-True ($ledger.primarySessionId -eq 'fake-session') 'PATH-resolved Claude batch shim did not execute'
+
     $successJson = (& $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-String).Trim()
     $successResult = $successJson | ConvertFrom-Json
     Assert-True ($successResult.taskId -eq 'task-direct') 'runner did not return normalized task JSON'
@@ -302,6 +414,21 @@ exit /b 0
     Assert-True (Test-Path -LiteralPath $lockPath) 'runner removed a lock it did not own'
     Remove-Item -LiteralPath $lockPath -Force
 
+    $ownedLockToken = Enter-TaskLock -LockPath $lockPath -TaskId 'owned-lock'
+    Set-Content -LiteralPath $lockPath -Value 'replacement-lock'
+    Exit-TaskLock -LockPath $lockPath -OwnershipToken $ownedLockToken
+    Assert-True (Test-Path -LiteralPath $lockPath) 'lock cleanup deleted a replacement lock'
+    Remove-Item -LiteralPath $lockPath -Force
+
+    $env:CLAUDE_FAKE_MODE = 'replace-lock'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    Assert-True ((Get-Content -Raw -LiteralPath $lockPath).Trim() -eq 'replacement-lock') 'runner cleanup deleted a lock replaced during execution'
+    Remove-Item -LiteralPath $lockPath -Force
+
     $env:CLAUDE_FAKE_MODE = 'malformed'
     try {
         & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
@@ -312,6 +439,34 @@ exit /b 0
     $malformedRecord = @($ledger.tasks)[-1]
     Assert-True ($malformedRecord.status -eq 'needs-review') 'malformed output must require review'
     Assert-True ((Get-Content -Raw -LiteralPath $malformedRecord.rawOutputPath).Trim() -eq 'not-json') 'malformed raw output was not retained'
+
+    foreach ($invalidResultMode in @('mismatched-id', 'wrong-types', 'bad-status', 'extra-field', 'invalid-test')) {
+        $primaryBeforeInvalidResult = $ledger.primarySessionId
+        $env:CLAUDE_FAKE_MODE = $invalidResultMode
+        try {
+            & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+        } finally {
+            Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        }
+        $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+        $invalidResultRecord = @($ledger.tasks)[-1]
+        $invalidNormalized = Get-Content -Raw -LiteralPath $invalidResultRecord.resultPath | ConvertFrom-Json
+        Assert-True ($invalidNormalized.status -eq 'failed') "invalid result contract was accepted: $invalidResultMode"
+        Assert-True ($ledger.primarySessionId -eq $primaryBeforeInvalidResult) "invalid result session was persisted: $invalidResultMode"
+    }
+
+    $env:CLAUDE_FAKE_MODE = 'nonzero'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $nonzeroRecord = @($ledger.tasks)[-1]
+    $nonzeroResult = Get-Content -Raw -LiteralPath $nonzeroRecord.resultPath | ConvertFrom-Json
+    Assert-True (@($nonzeroRecord.attempts).Count -eq 1) 'ordinary nonzero failure was retried'
+    Assert-True ($nonzeroRecord.exitCode -eq 7) 'ordinary nonzero exit code was not retained'
+    Assert-True ($nonzeroResult.status -eq 'failed') 'ordinary nonzero exit was not normalized as failure'
 
     $timeoutTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
     $timeoutTask.id = 'task-timeout'
@@ -334,6 +489,66 @@ exit /b 0
     Assert-True ([bool]$timeoutRecord.attempts[0].timedOut) 'timeout attempt was not identified'
     Assert-True ($timeoutStopwatch.Elapsed.TotalSeconds -lt 4) 'timeout waited for a descendant that inherited the output pipe'
 
+    $metacharTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $metacharTask.id = 'task-metachar'
+    $metacharTask.goal = '%ROUNDTRIP% & "quoted" (paren) ^ caret'
+    $metacharPath = Join-Path $state.stateDir 'task-metachar.json'
+    $metacharTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $metacharPath -Encoding UTF8
+    $env:CLAUDE_FAKE_MODE = 'capture-stdin'
+    $env:CLAUDE_FAKE_TASK = 'task-metachar'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $metacharPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\CLAUDE_FAKE_TASK -ErrorAction SilentlyContinue
+    }
+    $capturedPrompt = Get-Content -Raw -LiteralPath (Join-Path $state.stateDir 'captured-stdin.txt')
+    $capturedTask = $capturedPrompt.Substring($capturedPrompt.IndexOf('{')) | ConvertFrom-Json
+    Assert-True ($capturedTask.goal -eq '%ROUNDTRIP% & "quoted" (paren) ^ caret') 'task metacharacters did not round-trip through standard input'
+
+    $savedTeamEnvironment = $env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+    $env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = 'inherited'
+    $env:CLAUDE_FAKE_MODE = 'capture-environment'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        if ($null -eq $savedTeamEnvironment) {
+            Remove-Item Env:\CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS -ErrorAction SilentlyContinue
+        } else {
+            $env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = $savedTeamEnvironment
+        }
+    }
+    $childTeamEnvironment = (Get-Content -Raw -LiteralPath (Join-Path $state.stateDir 'child-team-env.txt')).Trim()
+    Assert-True ($childTeamEnvironment -eq '<unset>') 'non-team child inherited the experimental agent-team environment'
+
+    $env:CLAUDE_FAKE_MODE = 'large'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $largeRecord = @($ledger.tasks)[-1]
+    Assert-True ((Get-Content -Raw -LiteralPath $largeRecord.rawOutputPath).Length -gt 7000) 'large successful output was truncated'
+
+    $unsafeIdTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $unsafeIdTask.id = '../escape:star'
+    $unsafeIdPath = Join-Path $state.stateDir 'task-unsafe-id.json'
+    $unsafeIdTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $unsafeIdPath -Encoding UTF8
+    $env:CLAUDE_FAKE_TASK = '../escape:star'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $unsafeIdPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_TASK -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $unsafeIdRecord = @($ledger.tasks)[-1]
+    $statePrefixForArtifacts = $state.stateDir.TrimEnd('\') + '\'
+    foreach ($artifactPath in @($unsafeIdRecord.rawOutputPath, $unsafeIdRecord.rawErrorPath, $unsafeIdRecord.resultPath)) {
+        Assert-True ($artifactPath.StartsWith($statePrefixForArtifacts, [System.StringComparison]::OrdinalIgnoreCase)) 'unsafe task ID escaped the state directory'
+    }
+
     $beforeFingerprint = Get-WorktreeFingerprint -Worktree $linked
     Add-Content -LiteralPath (Join-Path $linked 'src/parser.ps1') -Value 'second-change'
     $afterFingerprint = Get-WorktreeFingerprint -Worktree $linked
@@ -351,9 +566,28 @@ exit /b 0
     Assert-True ($allowedRecord.changedDuringTask -contains 'src/parser.ps1') 'runner missed a change to an already dirty allowed file'
     Assert-True (@($allowedRecord.scopeViolations).Count -eq 0) 'allowed path was rejected'
 
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value '.env'
+    Set-Content -LiteralPath (Join-Path $linked '.env') -Value 'ignored-before'
+    $env:CLAUDE_FAKE_MODE = 'ignored-edit'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $ignoredRecord = @($ledger.tasks)[-1]
+    Assert-True ($ignoredRecord.changedDuringTask -contains '.env') 'ignored file change bypassed fingerprinting'
+    Assert-True ($ignoredRecord.status -eq 'rejected') 'ignored forbidden file change was not rejected'
+
     $scopeViolations = Get-ScopeViolations -ChangedPaths @('.github/workflows/ci.yml', 'src/parser.ps1') -Task $executionTask
     Assert-True ($scopeViolations -contains '.github/workflows/ci.yml') 'forbidden path was not detected'
     Assert-True (-not ($scopeViolations -contains 'src/parser.ps1')) 'allowed path was rejected by the scope helper'
+    $windowsPatternTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $windowsPatternTask.allowedPaths = @('src\**')
+    $windowsPatternTask.forbiddenPaths = @('.github\**')
+    $windowsPatternViolations = Get-ScopeViolations -ChangedPaths @('.github/workflows/ci.yml', 'src/parser.ps1') -Task $windowsPatternTask
+    Assert-True ($windowsPatternViolations -contains '.github/workflows/ci.yml') 'Windows forbidden pattern was not normalized'
+    Assert-True (-not ($windowsPatternViolations -contains 'src/parser.ps1')) 'Windows allowed pattern was not normalized'
 
     $env:CLAUDE_FAKE_MODE = 'forbidden-edit'
     try {
@@ -409,6 +643,61 @@ exit /b 0
     $teamRecord = @($ledger.tasks)[-1]
     Assert-True ($teamRecord.sessionId -eq 'team-session') 'team session was not recorded on its task'
     Assert-True ($ledger.primarySessionId -eq 'fake-session') 'team session replaced the primary session'
+
+    $env:CLAUDE_FAKE_MODE = 'head-change'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $headRecord = @($ledger.tasks)[-1]
+    Assert-True ($headRecord.status -eq 'rejected') 'HEAD mutation was not rejected'
+    Assert-True ($headRecord.repositoryViolations -contains 'head-changed') 'HEAD mutation was not recorded'
+
+    $env:CLAUDE_FAKE_MODE = 'branch-change'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $branchRecord = @($ledger.tasks)[-1]
+    Assert-True ($branchRecord.status -eq 'rejected') 'branch mutation was not rejected'
+    Assert-True ($branchRecord.repositoryViolations -contains 'branch-changed') 'branch mutation was not recorded'
+    Assert-True ((Invoke-TestGit $linked @('branch', '--show-current')) -contains 'delegated-branch') 'runner automatically reverted a branch mutation'
+
+    $corruptMain = Join-Path $fixtureRoot 'corrupt-main'
+    $corruptLinked = Join-Path $fixtureRoot 'corrupt-feature'
+    New-Item -ItemType Directory -Force -Path $corruptMain | Out-Null
+    Invoke-TestGit $corruptMain @('init') | Out-Null
+    Invoke-TestGit $corruptMain @('config', 'user.email', 'tests@example.invalid') | Out-Null
+    Invoke-TestGit $corruptMain @('config', 'user.name', 'Delegation Tests') | Out-Null
+    Set-Content -LiteralPath (Join-Path $corruptMain 'seed.txt') -Value 'seed'
+    Invoke-TestGit $corruptMain @('add', 'seed.txt') | Out-Null
+    Invoke-TestGit $corruptMain @('commit', '-m', 'seed') | Out-Null
+    Invoke-TestGit $corruptMain @('worktree', 'add', '-b', 'feature/corrupt', $corruptLinked) | Out-Null
+    $corruptContext = Get-WorktreeContext -WorktreePath $corruptLinked
+    $corruptState = Initialize-HandoffState -Context $corruptContext
+    $corruptTaskPath = Join-Path $corruptState.stateDir 'task-corrupt.json'
+    $executionTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $corruptTaskPath -Encoding UTF8
+    $env:CLAUDE_FAKE_MODE = 'git-corrupt'
+    $corruptionThrew = $false
+    try {
+        & $Runner -WorktreePath $corruptLinked -TaskPacketPath $corruptTaskPath -ClaudeCommand $fakeClaude | Out-Null
+    } catch {
+        $corruptionThrew = $true
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $corruptEntered = Test-Path -LiteralPath (Join-Path $corruptState.stateDir 'corrupt-entered.txt')
+    $corruptError = if (Test-Path -LiteralPath (Join-Path $corruptState.stateDir 'corrupt-error.txt')) { Get-Content -Raw -LiteralPath (Join-Path $corruptState.stateDir 'corrupt-error.txt') } else { '<none>' }
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $corruptLinked '.git')) -match 'missing-delegation-gitdir') "fake corruption did not alter the disposable fixture; entered=$corruptEntered error=$corruptError"
+    Assert-True (-not $corruptionThrew) 'post-run Git corruption escaped ledger finalization'
+    $corruptLedger = Get-Content -Raw -LiteralPath $corruptState.ledgerPath | ConvertFrom-Json
+    $corruptRecord = @($corruptLedger.tasks)[-1]
+    Assert-True ($corruptRecord.status -eq 'rejected') 'post-run Git probe failure was not rejected'
+    Assert-True (@($corruptRecord.repositoryViolations | Where-Object { $_ -like '*probe-failed' }).Count -gt 0) 'post-run Git probe failure was not recorded'
 
     Invoke-TestGit $linked @('checkout', '--detach') | Out-Null
     $detachedContext = Get-WorktreeContext -WorktreePath $linked

@@ -165,7 +165,7 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
     }
     $prompt = "Execute the bounded task packet below. $modeDirective Do not commit, push, switch branches, modify remotes, or expand scope.`n`n" +
               ($Task | ConvertTo-Json -Depth 12)
-    $args = @('-p', $prompt, '--dangerously-skip-permissions', '--output-format', 'json',
+    $args = @('-p', '--dangerously-skip-permissions', '--output-format', 'json',
               '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
     $args += '--disallowedTools'
     $args += @(
@@ -187,11 +187,24 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
         $args += @('--verbose', '--forward-subagent-text')
     }
     if ($fresh) { $environment['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS'] = '1' }
-    [pscustomobject]@{ arguments = [object[]]$args; environment = $environment; freshSession = $fresh }
+    [pscustomobject]@{
+        arguments = [object[]]$args
+        environment = $environment
+        freshSession = $fresh
+        standardInput = $prompt
+    }
 }
 
 function Test-ClaudeAvailable([string]$Command) {
     return $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
+}
+
+function Resolve-ClaudeCommandPath([string]$Command) {
+    $resolved = Get-Command $Command -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $resolved) { throw "Claude command was not found: $Command" }
+    $path = if ($resolved.Path) { $resolved.Path } elseif ($resolved.Source) { $resolved.Source } else { $resolved.Definition }
+    if ([string]::IsNullOrWhiteSpace($path)) { throw "Claude command could not be resolved: $Command" }
+    return [System.IO.Path]::GetFullPath($path)
 }
 
 function Test-ClaudeAuthenticated([string]$Command) {
@@ -232,11 +245,13 @@ function Set-OwnerWaitState([string]$LedgerPath, $Task, [string]$Reason) {
 }
 
 function Enter-TaskLock([string]$LockPath, [string]$TaskId) {
+    $ownershipToken = [guid]::NewGuid().ToString('N')
     try {
         $stream = [System.IO.File]::Open($LockPath, 'CreateNew', 'Write', 'None')
         $writer = New-Object System.IO.StreamWriter($stream)
-        $writer.WriteLine("$TaskId`n$PID`n$([DateTimeOffset]::UtcNow.ToString('o'))")
+        $writer.WriteLine("$ownershipToken`n$TaskId`n$PID`n$([DateTimeOffset]::UtcNow.ToString('o'))")
         $writer.Dispose()
+        return $ownershipToken
     } catch {
         if ($null -ne $writer) { $writer.Dispose() }
         elseif ($null -ne $stream) { $stream.Dispose() }
@@ -244,19 +259,35 @@ function Enter-TaskLock([string]$LockPath, [string]$TaskId) {
     }
 }
 
-function Exit-TaskLock([string]$LockPath) {
-    if (Test-Path -LiteralPath $LockPath) {
+function Exit-TaskLock([string]$LockPath, [string]$OwnershipToken) {
+    if (-not $OwnershipToken -or -not (Test-Path -LiteralPath $LockPath)) { return }
+    $recordedToken = Get-Content -LiteralPath $LockPath -TotalCount 1 -ErrorAction SilentlyContinue
+    if ($recordedToken -eq $OwnershipToken) {
         Remove-Item -LiteralPath $LockPath -Force
     }
 }
 
 function Get-WorktreeFingerprint([string]$Worktree) {
-    $paths = (Invoke-Git $Worktree @('ls-files', '-co', '--exclude-standard')) -split "`r?`n"
     $map = @{}
-    foreach ($relative in $paths | Where-Object { $_ }) {
-        $full = Join-Path $Worktree $relative
-        if (Test-Path -LiteralPath $full -PathType Leaf) {
-            $map[$relative.Replace('\', '/')] = (Get-FileHash -Algorithm SHA256 -LiteralPath $full).Hash
+    $root = Get-Item -LiteralPath $Worktree -ErrorAction Stop
+    $rootPrefixLength = $root.FullName.TrimEnd('\', '/').Length + 1
+    $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+    $pending.Push($root)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($file in $directory.GetFiles()) {
+            $relative = $file.FullName.Substring($rootPrefixLength).Replace('\', '/')
+            if ($relative -eq '.git' -or $relative.StartsWith('.codex/claude-handoff/', [System.StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            $map[$relative] = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash
+        }
+        foreach ($child in $directory.GetDirectories()) {
+            $relative = $child.FullName.Substring($rootPrefixLength).Replace('\', '/')
+            if ($relative -eq '.git' -or $relative -eq '.codex/claude-handoff') { continue }
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            $pending.Push($child)
         }
     }
     return $map
@@ -271,11 +302,43 @@ function Get-ScopeViolations([string[]]$ChangedPaths, $Task) {
     $violations = @()
     foreach ($path in $ChangedPaths) {
         $normalized = $path.Replace('\', '/')
-        $forbidden = @($Task.forbiddenPaths | Where-Object { $normalized -like $_ }).Count -gt 0
-        $allowed = @($Task.allowedPaths | Where-Object { $normalized -like $_ }).Count -gt 0
+        $forbidden = @($Task.forbiddenPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Where-Object { $normalized -like $_ }).Count -gt 0
+        $allowed = @($Task.allowedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Where-Object { $normalized -like $_ }).Count -gt 0
         if ($forbidden -or -not $allowed) { $violations += $normalized }
     }
     return @($violations | Sort-Object -Unique)
+}
+
+function Get-GitProbe([string]$Worktree, [string[]]$Arguments, [string]$Name) {
+    try {
+        return [pscustomobject]@{
+            Success = $true
+            Value = Invoke-Git $Worktree $Arguments
+            Violation = $null
+        }
+    } catch {
+        return [pscustomobject]@{
+            Success = $false
+            Value = $null
+            Violation = "$Name-probe-failed"
+        }
+    }
+}
+
+function Get-FingerprintProbe([string]$Worktree) {
+    try {
+        return [pscustomobject]@{
+            Success = $true
+            Value = Get-WorktreeFingerprint -Worktree $Worktree
+            Violation = $null
+        }
+    } catch {
+        return [pscustomobject]@{
+            Success = $false
+            Value = $null
+            Violation = 'fingerprint-probe-failed'
+        }
+    }
 }
 
 function ConvertTo-ProcessArgument([string]$Value) {
@@ -306,9 +369,13 @@ function Invoke-ClaudeProcess(
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardInput = $true
     $startInfo.CreateNoWindow = $true
     foreach ($entry in $Invocation.environment.GetEnumerator()) {
         $startInfo.EnvironmentVariables[$entry.Key] = [string]$entry.Value
+    }
+    if (-not $Invocation.environment.ContainsKey('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS')) {
+        [void]$startInfo.EnvironmentVariables.Remove('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS')
     }
     if ($null -ne $startInfo.PSObject.Properties['ArgumentList']) {
         foreach ($argument in $Invocation.arguments) {
@@ -334,6 +401,10 @@ function Invoke-ClaudeProcess(
     $exitCode = $null
     try {
         $started = $process.Start()
+        if ($null -ne $Invocation.standardInput) {
+            $process.StandardInput.Write([string]$Invocation.standardInput)
+        }
+        $process.StandardInput.Close()
         $timeoutMilliseconds = [int][math]::Min([decimal][int]::MaxValue, $TimeoutSeconds * 1000)
         $readers = @(
             [pscustomobject]@{
@@ -374,13 +445,18 @@ function Invoke-ClaudeProcess(
         $executionWatch.Stop()
         if (-not $process.HasExited) {
             $timedOut = $true
-            $process.Kill()
+            try {
+                $process.Kill()
+            } catch {
+                if (-not $process.HasExited) { throw }
+            }
         }
         if (-not $process.WaitForExit(2000)) {
             throw 'Claude process did not exit after termination.'
         }
+        $drainLimitMilliseconds = if ($timedOut) { 250 } else { 2000 }
         $drainWatch = [System.Diagnostics.Stopwatch]::StartNew()
-        while (@($readers | Where-Object { -not $_.Complete }).Count -gt 0 -and $drainWatch.ElapsedMilliseconds -lt 250) {
+        while (@($readers | Where-Object { -not $_.Complete }).Count -gt 0 -and $drainWatch.ElapsedMilliseconds -lt $drainLimitMilliseconds) {
             foreach ($readerState in $readers | Where-Object { -not $_.Complete -and $_.Task.IsCompleted }) {
                 try {
                     $count = $readerState.Task.GetAwaiter().GetResult()
@@ -402,7 +478,11 @@ function Invoke-ClaudeProcess(
         $exitCode = $process.ExitCode
     } finally {
         if ($started -and -not $process.HasExited) {
-            $process.Kill()
+            try {
+                $process.Kill()
+            } catch {
+                if (-not $process.HasExited) { throw }
+            }
             [void]$process.WaitForExit(2000)
         }
         $process.Dispose()
@@ -419,7 +499,35 @@ function Invoke-ClaudeProcess(
     }
 }
 
-function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut) {
+function Test-ClaudeResultContract($Result, $Task) {
+    if ($null -eq $Result -or $Result -isnot [pscustomobject]) { return $false }
+    $required = @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'unresolvedIssues', 'deviations')
+    $names = @($Result.PSObject.Properties.Name)
+    if ($names.Count -ne $required.Count -or @($required | Where-Object { $names -notcontains $_ }).Count -gt 0) { return $false }
+    if ($Result.taskId -isnot [string] -or $Result.taskId -ne [string]$Task.id) { return $false }
+    if ($Result.status -isnot [string] -or @('completed', 'blocked', 'failed') -notcontains $Result.status) { return $false }
+    if ($Result.summary -isnot [string]) { return $false }
+    foreach ($arrayName in @('changedFiles', 'tests', 'unresolvedIssues', 'deviations')) {
+        if ($Result.$arrayName -isnot [System.Array]) { return $false }
+    }
+    foreach ($value in @($Result.changedFiles) + @($Result.unresolvedIssues) + @($Result.deviations)) {
+        if ($value -isnot [string]) { return $false }
+    }
+    foreach ($testResult in @($Result.tests)) {
+        if ($testResult -isnot [pscustomobject]) { return $false }
+        $testNames = @($testResult.PSObject.Properties.Name)
+        $allowedTestNames = @('command', 'outcome', 'details')
+        if ($testNames -notcontains 'command' -or $testNames -notcontains 'outcome' -or
+            @($testNames | Where-Object { $allowedTestNames -notcontains $_ }).Count -gt 0) {
+            return $false
+        }
+        if ($testResult.command -isnot [string] -or @('passed', 'failed', 'not-run') -notcontains $testResult.outcome) { return $false }
+        if ($testNames -contains 'details' -and $testResult.details -isnot [string]) { return $false }
+    }
+    return $true
+}
+
+function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut, [int]$ExitCode) {
     $envelope = $null
     if (-not $TimedOut) {
         foreach ($line in @($Output -split "`r?`n")) {
@@ -442,18 +550,15 @@ function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut) {
     if ($result -is [string]) {
         try { $result = $result | ConvertFrom-Json } catch { $result = $null }
     }
-    $required = @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'unresolvedIssues', 'deviations')
-    $valid = $null -ne $result
-    if ($valid) {
-        foreach ($property in $required) {
-            if ($result.PSObject.Properties.Name -notcontains $property) {
-                $valid = $false
-                break
-            }
-        }
-    }
+    $valid = -not $TimedOut -and $ExitCode -eq 0 -and (Test-ClaudeResultContract -Result $result -Task $Task)
     if (-not $valid) {
-        $reason = if ($TimedOut) { 'Claude execution timed out.' } else { 'Claude returned malformed or incomplete JSON.' }
+        $reason = if ($TimedOut) {
+            'Claude execution timed out.'
+        } elseif ($ExitCode -ne 0) {
+            "Claude exited with code $ExitCode."
+        } else {
+            'Claude returned malformed or incomplete JSON.'
+        }
         $result = [pscustomobject][ordered]@{
             taskId = [string]$Task.id
             status = 'failed'
@@ -464,9 +569,9 @@ function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut) {
             deviations = @()
         }
     }
-    $sessionId = if ($null -ne $envelope.session_id) {
+    $sessionId = if ($valid -and $null -ne $envelope.session_id) {
         [string]$envelope.session_id
-    } elseif ($null -ne $envelope.sessionId) {
+    } elseif ($valid -and $null -ne $envelope.sessionId) {
         [string]$envelope.sessionId
     } else {
         $null
@@ -490,8 +595,9 @@ function Get-ClaudeVersionSupport([string]$ClaudeCommand) {
 
 function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
     $lockAcquired = $false
+    $lockOwnershipToken = $null
     try {
-        Enter-TaskLock -LockPath $State.lockPath -TaskId $Task.id
+        $lockOwnershipToken = Enter-TaskLock -LockPath $State.lockPath -TaskId $Task.id
         $lockAcquired = $true
 
         $startedAt = [DateTimeOffset]::UtcNow.ToString('o')
@@ -502,7 +608,8 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         $beforeFingerprint = Get-WorktreeFingerprint -Worktree $Context.worktreePath
         $ledger = Get-Content -Raw -LiteralPath $State.ledgerPath | ConvertFrom-Json
         $sessionId = if ($Task.mode -eq 'agent-team') { $null } else { [string]$ledger.primarySessionId }
-        $supportsForwarding = Get-ClaudeVersionSupport -ClaudeCommand $ClaudeCommand
+        $resolvedClaudeCommand = Resolve-ClaudeCommandPath -Command $ClaudeCommand
+        $supportsForwarding = Get-ClaudeVersionSupport -ClaudeCommand $resolvedClaudeCommand
         $invocation = New-ClaudeInvocation -Task $Task -SessionId $sessionId -SupportsForwarding $supportsForwarding
         $attempts = @()
         $runToken = [guid]::NewGuid().ToString('N')
@@ -510,9 +617,9 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         $retryWithoutSession = $false
 
         do {
-            $rawOutputPath = Join-Path $State.stateDir "$($Task.id)-$runToken-attempt-$attemptNumber.stdout.log"
-            $rawErrorPath = Join-Path $State.stateDir "$($Task.id)-$runToken-attempt-$attemptNumber.stderr.log"
-            $process = Invoke-ClaudeProcess -Context $Context -Invocation $invocation -ClaudeCommand $ClaudeCommand `
+            $rawOutputPath = Join-Path $State.stateDir "$runToken-attempt-$attemptNumber.stdout.log"
+            $rawErrorPath = Join-Path $State.stateDir "$runToken-attempt-$attemptNumber.stderr.log"
+            $process = Invoke-ClaudeProcess -Context $Context -Invocation $invocation -ClaudeCommand $resolvedClaudeCommand `
                 -TimeoutSeconds $Task.limits.timeoutSeconds -RawOutputPath $rawOutputPath -RawErrorPath $rawErrorPath
             $wasResumed = $invocation.arguments -contains '--resume'
             $attempts += [pscustomobject][ordered]@{
@@ -535,20 +642,28 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             }
         } while ($retryWithoutSession)
 
-        $parsed = ConvertFrom-ClaudeOutput -Output $process.StandardOutput -Task $Task -TimedOut $process.TimedOut
-        $normalizedResultPath = Join-Path $State.stateDir "$($Task.id)-$runToken-result.json"
+        $parsed = ConvertFrom-ClaudeOutput -Output $process.StandardOutput -Task $Task -TimedOut $process.TimedOut -ExitCode $process.ExitCode
+        $normalizedResultPath = Join-Path $State.stateDir "$runToken-result.json"
         $parsed.Result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $normalizedResultPath -Encoding UTF8
 
-        $endingHead = Invoke-Git $Context.worktreePath @('rev-parse', 'HEAD')
-        $endingBranch = Invoke-Git $Context.worktreePath @('branch', '--show-current')
-        $endingRemotes = Invoke-Git $Context.worktreePath @('remote', '-v')
-        $afterFingerprint = Get-WorktreeFingerprint -Worktree $Context.worktreePath
-        $changedDuringTask = Compare-WorktreeFingerprint -Before $beforeFingerprint -After $afterFingerprint
+        $endingHeadProbe = Get-GitProbe -Worktree $Context.worktreePath -Arguments @('rev-parse', 'HEAD') -Name 'head'
+        $endingBranchProbe = Get-GitProbe -Worktree $Context.worktreePath -Arguments @('branch', '--show-current') -Name 'branch'
+        $endingRemotesProbe = Get-GitProbe -Worktree $Context.worktreePath -Arguments @('remote', '-v') -Name 'remotes'
+        $endingStatusProbe = Get-GitProbe -Worktree $Context.worktreePath -Arguments @('status', '--porcelain=v1') -Name 'status'
+        $afterFingerprintProbe = Get-FingerprintProbe -Worktree $Context.worktreePath
+        $changedDuringTask = if ($afterFingerprintProbe.Success) {
+            Compare-WorktreeFingerprint -Before $beforeFingerprint -After $afterFingerprintProbe.Value
+        } else {
+            @()
+        }
         $scopeViolations = Get-ScopeViolations -ChangedPaths $changedDuringTask -Task $Task
         $repositoryViolations = @()
-        if ($startingHead -ne $endingHead) { $repositoryViolations += 'head-changed' }
-        if ($startingBranch -ne $endingBranch) { $repositoryViolations += 'branch-changed' }
-        if ($startingRemotes -ne $endingRemotes) { $repositoryViolations += 'remotes-changed' }
+        foreach ($probe in @($endingHeadProbe, $endingBranchProbe, $endingRemotesProbe, $endingStatusProbe, $afterFingerprintProbe)) {
+            if (-not $probe.Success) { $repositoryViolations += $probe.Violation }
+        }
+        if ($endingHeadProbe.Success -and $startingHead -ne $endingHeadProbe.Value) { $repositoryViolations += 'head-changed' }
+        if ($endingBranchProbe.Success -and $startingBranch -ne $endingBranchProbe.Value) { $repositoryViolations += 'branch-changed' }
+        if ($endingRemotesProbe.Success -and $startingRemotes -ne $endingRemotesProbe.Value) { $repositoryViolations += 'remotes-changed' }
         $reviewStatus = if (@($scopeViolations).Count -gt 0 -or @($repositoryViolations).Count -gt 0) {
             'rejected'
         } else {
@@ -564,7 +679,7 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             exitCode = $process.ExitCode
             timedOut = $process.TimedOut
             startingGitStatus = $startingStatus
-            endingGitStatus = Invoke-Git $Context.worktreePath @('status', '--porcelain=v1')
+            endingGitStatus = $endingStatusProbe.Value
             changedDuringTask = @($changedDuringTask)
             scopeViolations = @($scopeViolations)
             repositoryViolations = @($repositoryViolations)
@@ -585,7 +700,7 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         return $parsed.Result
     } finally {
         if ($lockAcquired) {
-            Exit-TaskLock -LockPath $State.lockPath
+            Exit-TaskLock -LockPath $State.lockPath -OwnershipToken $lockOwnershipToken
         }
     }
 }
@@ -612,10 +727,11 @@ if (-not $LibraryMode) {
         Show-OwnerSetup -Worktree $context.worktreePath -Installed $false
         throw 'Claude Code setup requires owner action.'
     }
-    if (-not (Test-ClaudeAuthenticated $ClaudeCommand)) {
+    $resolvedClaudeCommand = Resolve-ClaudeCommandPath -Command $ClaudeCommand
+    if (-not (Test-ClaudeAuthenticated $resolvedClaudeCommand)) {
         Set-OwnerWaitState -LedgerPath $state.ledgerPath -Task $task -Reason 'claude-authentication-required'
         Show-OwnerSetup -Worktree $context.worktreePath -Installed $true
         throw 'Claude Code authentication requires owner action.'
     }
-    Invoke-Delegation -Context $context -State $state -Task $task -ClaudeCommand $ClaudeCommand | ConvertTo-Json -Depth 12
+    Invoke-Delegation -Context $context -State $state -Task $task -ClaudeCommand $resolvedClaudeCommand | ConvertTo-Json -Depth 12
 }
