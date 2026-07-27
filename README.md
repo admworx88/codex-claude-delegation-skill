@@ -25,7 +25,9 @@ include secrets in task packets or the local ledger.
 
 ## Prerequisites
 
-- Windows with Windows PowerShell 5.1 or PowerShell 7
+- Windows with Windows PowerShell 5.1 (`powershell.exe`); PowerShell 7 may be
+  used to start the runner, but the visible owner-setup window uses Windows
+  PowerShell
 - Git with linked-worktree support
 - Codex with local skill support
 - [Claude Code CLI](https://code.claude.com/docs/en/installation)
@@ -34,8 +36,11 @@ include secrets in task packets or the local ledger.
 
 If Claude is missing or needs authentication, the runner records
 `waiting-for-owner`, opens a visible PowerShell window, and stops. The owner
-installs or signs in interactively, closes that window, and then asks Codex to
-retry. The skill does not install Claude or authenticate on the owner's behalf.
+uses that same window to install or sign in interactively, closes it when
+finished, and then asks Codex to retry. When Claude is missing, press Enter in
+the setup window to reach its interactive prompt before installing and running
+`claude auth login`. The skill does not install Claude or authenticate on the
+owner's behalf.
 
 ## Install
 
@@ -93,7 +98,10 @@ the durable source of context.
 
 ## Validate and test
 
-From the repository root:
+From the repository root. The deterministic PowerShell suite needs only the
+runtime prerequisites above. The optional skill metadata validator additionally
+requires Python 3 and
+[PyYAML](https://pyyaml.org/wiki/PyYAMLDocumentation) (`python -m pip install PyYAML`):
 
 ```powershell
 python "$HOME\.codex\skills\.system\skill-creator\scripts\quick_validate.py" `

@@ -345,10 +345,25 @@ exit /b 0
     }
     try {
         Show-OwnerSetup -Worktree $linked -Installed $true
-        $setupArguments = @($capturedStartProcess.ArgumentList) -join ' '
-        Assert-True ($setupArguments -match 'claude auth login') 'owner setup did not offer authentication'
-        Assert-True ($setupArguments -notmatch 'dangerously-skip-permissions') 'owner setup received bypass permissions'
+        $installedSetup = $capturedStartProcess
+        $installedSetupArguments = @($installedSetup.ArgumentList) -join ' '
+        Assert-True ($installedSetup.FilePath -eq 'powershell') 'owner setup must launch Windows PowerShell'
+        Assert-True ($installedSetup.ArgumentList -contains '-NoExit') 'owner setup window must remain open for manual work'
+        Assert-True ($installedSetupArguments -match 'if \(Get-Command claude') 'installed setup must verify Claude before login'
+        Assert-True ($installedSetupArguments -match 'claude auth login') 'installed setup did not offer authentication'
+        Assert-True ($installedSetupArguments -notmatch 'dangerously-skip-permissions') 'owner setup received bypass permissions'
         Assert-True ($capturedStartProcess.WorkingDirectory -eq $linked) 'owner setup used the wrong working directory'
+
+        Show-OwnerSetup -Worktree $linked -Installed $false
+        $missingSetup = $capturedStartProcess
+        $missingSetupArguments = @($missingSetup.ArgumentList) -join ' '
+        Assert-True ($missingSetup.FilePath -eq 'powershell') 'missing setup must launch Windows PowerShell'
+        Assert-True ($missingSetup.ArgumentList -contains '-NoExit') 'missing setup window must remain open for installation'
+        Assert-True ($missingSetupArguments -match 'Press Enter to reach the interactive PowerShell prompt') 'missing setup must explain how to reach the interactive prompt'
+        Assert-True ($missingSetupArguments -match "install Claude Code, then run ''claude auth login'' here") 'missing setup must direct install and authentication in the same window'
+        Assert-True ($missingSetupArguments -notmatch 'if \(Get-Command claude') 'missing setup must not try authentication before manual installation'
+        Assert-True ($missingSetupArguments -notmatch 'dangerously-skip-permissions') 'missing owner setup received bypass permissions'
+        Assert-True ($missingSetup.WorkingDirectory -eq $linked) 'missing owner setup used the wrong working directory'
     } finally {
         Remove-Item -Path Function:\Start-Process -Force
     }

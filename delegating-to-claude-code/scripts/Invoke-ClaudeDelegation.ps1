@@ -235,13 +235,17 @@ function Test-ClaudeAuthenticated([string]$Command) {
 
 function Show-OwnerSetup([string]$Worktree, [bool]$Installed) {
     $message = if ($Installed) {
-        "Claude Code needs owner authentication. Run 'claude auth login' here, complete login, then close this window."
+        "Claude Code needs owner authentication. Complete the login here; this window stays open at an interactive PowerShell prompt afterward. Close it when finished."
     } else {
-        "Claude Code CLI is not installed. Follow the official instructions at https://code.claude.com/docs/en/setup, then run 'claude' and authenticate."
+        "Claude Code CLI is not installed. Press Enter to reach the interactive PowerShell prompt; install Claude Code, then run 'claude auth login' here. Close this window when finished. Installation help: https://code.claude.com/docs/en/setup"
     }
     $escaped = $message.Replace("'", "''")
     $escapedWorktree = $Worktree.Replace("'", "''")
-    $command = "Set-Location -LiteralPath '$escapedWorktree'; Write-Host '$escaped' -ForegroundColor Yellow; if (Get-Command claude -ErrorAction SilentlyContinue) { claude auth login }; Read-Host 'Press Enter to close'"
+    $command = if ($Installed) {
+        "Set-Location -LiteralPath '$escapedWorktree'; Write-Host '$escaped' -ForegroundColor Yellow; if (Get-Command claude -ErrorAction SilentlyContinue) { claude auth login } else { Write-Warning 'Claude Code CLI is no longer available. Install it in this window, then run claude auth login.' }; Write-Host 'Interactive PowerShell prompt ready. Close this window when finished.' -ForegroundColor Yellow"
+    } else {
+        "Set-Location -LiteralPath '$escapedWorktree'; Write-Host '$escaped' -ForegroundColor Yellow; Read-Host 'Press Enter to reach the interactive PowerShell prompt' | Out-Null; Write-Host 'Interactive PowerShell prompt ready. Install Claude Code and authenticate here, then close this window.' -ForegroundColor Yellow"
+    }
     Start-Process powershell -ArgumentList @('-NoExit', '-NoProfile', '-Command', $command) -WorkingDirectory $Worktree | Out-Null
 }
 
