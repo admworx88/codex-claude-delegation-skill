@@ -218,12 +218,22 @@ if not "%1"=="--version" goto modes
 echo 2.1.211 ^(Claude Code^)
 exit /b 0
 :modes
-if "%CLAUDE_FAKE_MODE%"=="malformed" (
-  echo not-json
-  exit /b 0
-)
 if "%CLAUDE_FAKE_MODE%"=="timeout" (
   ping 127.0.0.1 -n 6 >nul
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="no-stdin" (
+  ping 127.0.0.1 -n 8 >nul
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="capture-stdin" (
+  chcp 65001 >nul
+  powershell -NoProfile -Command "$utf8 = [System.Text.UTF8Encoding]::new($false); $reader = [System.IO.StreamReader]::new([Console]::OpenStandardInput(), $utf8); $text = $reader.ReadToEnd(); $path = Join-Path (Get-Location) '.codex\claude-handoff\captured-stdin.txt'; [System.IO.File]::WriteAllText($path, $text, $utf8)"
+) else (
+  more >nul
+)
+if "%CLAUDE_FAKE_MODE%"=="malformed" (
+  echo not-json
   exit /b 0
 )
 if "%CLAUDE_FAKE_MODE%"=="allowed-edit" (
@@ -251,12 +261,12 @@ if "%CLAUDE_FAKE_MODE%"=="replace-lock" (
 if "%CLAUDE_FAKE_MODE%"=="capture-environment" (
   if defined CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS (echo %CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS%) else (echo ^<unset^>) >"%CD%\.codex\claude-handoff\child-team-env.txt"
 )
-if "%CLAUDE_FAKE_MODE%"=="capture-stdin" (
-  more >"%CD%\.codex\claude-handoff\captured-stdin.txt"
-)
 if "%CLAUDE_FAKE_MODE%"=="large" (
   for /L %%A in (1,1,700) do <nul set /p "=0123456789"
   echo.
+)
+if "%CLAUDE_FAKE_MODE%"=="slow-eof" (
+  start "" /b powershell -NoProfile -Command "Start-Sleep -Seconds 3; Write-Output delayed-eof-marker"
 )
 if "%CLAUDE_FAKE_MODE%"=="mismatched-id" (
   echo {"type":"result","session_id":"invalid-session","result":{"taskId":"wrong-task","status":"completed","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[]}}
@@ -276,6 +286,22 @@ if "%CLAUDE_FAKE_MODE%"=="extra-field" (
 )
 if "%CLAUDE_FAKE_MODE%"=="invalid-test" (
   echo {"type":"result","session_id":"invalid-session","result":{"taskId":"task-direct","status":"completed","summary":"done","changedFiles":[],"tests":[{"command":"test","outcome":"unknown","extra":"no"}],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="wrong-case-property" (
+  echo {"type":"result","session_id":"invalid-session","result":{"TaskId":"task-direct","status":"completed","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="wrong-case-status" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"task-direct","status":"Completed","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="wrong-case-outcome" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"task-direct","status":"completed","summary":"done","changedFiles":[],"tests":[{"command":"test","outcome":"Passed"}],"unresolvedIssues":[],"deviations":[]}}
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="wrong-case-task-id" (
+  echo {"type":"result","session_id":"invalid-session","result":{"taskId":"TASK-DIRECT","status":"completed","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[]}}
   exit /b 0
 )
 if "%CLAUDE_FAKE_MODE%"=="nonzero" (
@@ -390,7 +416,8 @@ exit /b 0
         $env:PATH = $savedPath
     }
     $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
-    Assert-True ($ledger.primarySessionId -eq 'fake-session') 'PATH-resolved Claude batch shim did not execute'
+    $namedRecord = @($ledger.tasks)[-1]
+    Assert-True ($ledger.primarySessionId -eq 'fake-session') "PATH-resolved Claude batch shim did not execute; inputError=$($namedRecord.attempts[0].inputError) stdout=$(Get-Content -Raw -LiteralPath $namedRecord.rawOutputPath) stderr=$(Get-Content -Raw -LiteralPath $namedRecord.rawErrorPath)"
 
     $successJson = (& $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-String).Trim()
     $successResult = $successJson | ConvertFrom-Json
@@ -414,11 +441,16 @@ exit /b 0
     Assert-True (Test-Path -LiteralPath $lockPath) 'runner removed a lock it did not own'
     Remove-Item -LiteralPath $lockPath -Force
 
-    $ownedLockToken = Enter-TaskLock -LockPath $lockPath -TaskId 'owned-lock'
-    Set-Content -LiteralPath $lockPath -Value 'replacement-lock'
-    Exit-TaskLock -LockPath $lockPath -OwnershipToken $ownedLockToken
-    Assert-True (Test-Path -LiteralPath $lockPath) 'lock cleanup deleted a replacement lock'
-    Remove-Item -LiteralPath $lockPath -Force
+    $ownedLockHandle = Enter-TaskLock -LockPath $lockPath -TaskId 'owned-lock'
+    $replacementBlocked = $false
+    try {
+        Set-Content -LiteralPath $lockPath -Value 'replacement-lock'
+    } catch {
+        $replacementBlocked = $true
+    }
+    Assert-True $replacementBlocked 'exclusive lifetime lock allowed another owner to replace it'
+    Exit-TaskLock -LockHandle $ownedLockHandle
+    Assert-True (-not (Test-Path -LiteralPath $lockPath)) 'disposing the owned lifetime lock did not delete it'
 
     $env:CLAUDE_FAKE_MODE = 'replace-lock'
     try {
@@ -426,8 +458,7 @@ exit /b 0
     } finally {
         Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
     }
-    Assert-True ((Get-Content -Raw -LiteralPath $lockPath).Trim() -eq 'replacement-lock') 'runner cleanup deleted a lock replaced during execution'
-    Remove-Item -LiteralPath $lockPath -Force
+    Assert-True (-not (Test-Path -LiteralPath $lockPath)) 'runner lifetime lock was not deleted on cleanup'
 
     $env:CLAUDE_FAKE_MODE = 'malformed'
     try {
@@ -440,7 +471,10 @@ exit /b 0
     Assert-True ($malformedRecord.status -eq 'needs-review') 'malformed output must require review'
     Assert-True ((Get-Content -Raw -LiteralPath $malformedRecord.rawOutputPath).Trim() -eq 'not-json') 'malformed raw output was not retained'
 
-    foreach ($invalidResultMode in @('mismatched-id', 'wrong-types', 'bad-status', 'extra-field', 'invalid-test')) {
+    foreach ($invalidResultMode in @(
+        'mismatched-id', 'wrong-types', 'bad-status', 'extra-field', 'invalid-test',
+        'wrong-case-property', 'wrong-case-status', 'wrong-case-outcome', 'wrong-case-task-id'
+    )) {
         $primaryBeforeInvalidResult = $ledger.primarySessionId
         $env:CLAUDE_FAKE_MODE = $invalidResultMode
         try {
@@ -486,12 +520,37 @@ exit /b 0
     $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
     $timeoutRecord = @($ledger.tasks)[-1]
     Assert-True ($timeoutRecord.status -eq 'needs-review') 'timeout must require review'
-    Assert-True ([bool]$timeoutRecord.attempts[0].timedOut) 'timeout attempt was not identified'
+    Assert-True ([bool]$timeoutRecord.attempts[0].timedOut) "timeout attempt was not identified; elapsed=$($timeoutStopwatch.Elapsed.TotalSeconds) exit=$($timeoutRecord.exitCode) stderr=$(Get-Content -Raw -LiteralPath $timeoutRecord.rawErrorPath)"
     Assert-True ($timeoutStopwatch.Elapsed.TotalSeconds -lt 4) 'timeout waited for a descendant that inherited the output pipe'
+
+    $largeInputTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $largeInputTask.id = 'task-large-input'
+    $largeInputTask.goal = 'x' * 2097152
+    $largeInputTask.limits.timeoutSeconds = 1
+    $largeInputPath = Join-Path $state.stateDir 'task-large-input.json'
+    $largeInputTask | ConvertTo-Json -Depth 12 -Compress | Set-Content -LiteralPath $largeInputPath -Encoding UTF8
+    $env:CLAUDE_FAKE_MODE = 'no-stdin'
+    $env:CLAUDE_FAKE_TASK = 'task-large-input'
+    $largeInputStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $largeInputPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        $largeInputStopwatch.Stop()
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\CLAUDE_FAKE_TASK -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $largeInputRecord = @($ledger.tasks)[-1]
+    $largeInputResult = Get-Content -Raw -LiteralPath $largeInputRecord.resultPath | ConvertFrom-Json
+    Assert-True ($largeInputStopwatch.Elapsed.TotalSeconds -lt 4) 'large stdin blocked before the invocation deadline could terminate the child'
+    Assert-True ([bool]$largeInputRecord.timedOut) 'non-reading child did not record a timeout'
+    Assert-True ($largeInputResult.status -eq 'failed') 'non-reading child did not reach normalized result finalization'
 
     $metacharTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
     $metacharTask.id = 'task-metachar'
-    $metacharTask.goal = '%ROUNDTRIP% & "quoted" (paren) ^ caret'
+    $unicodeGoal = '%ROUNDTRIP% & "quoted" (paren) ^ caret - caf' + [char]0x00E9 + ' ' +
+        [char]0x65E5 + [char]0x672C + [char]0x8A9E + ' ' + [char]::ConvertFromUtf32(0x1F680)
+    $metacharTask.goal = $unicodeGoal
     $metacharPath = Join-Path $state.stateDir 'task-metachar.json'
     $metacharTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $metacharPath -Encoding UTF8
     $env:CLAUDE_FAKE_MODE = 'capture-stdin'
@@ -504,7 +563,9 @@ exit /b 0
     }
     $capturedPrompt = Get-Content -Raw -LiteralPath (Join-Path $state.stateDir 'captured-stdin.txt')
     $capturedTask = $capturedPrompt.Substring($capturedPrompt.IndexOf('{')) | ConvertFrom-Json
-    Assert-True ($capturedTask.goal -eq '%ROUNDTRIP% & "quoted" (paren) ^ caret') 'task metacharacters did not round-trip through standard input'
+    $expectedGoalCodes = ([char[]]$unicodeGoal | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ','
+    $actualGoalCodes = ([char[]][string]$capturedTask.goal | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ','
+    Assert-True ($capturedTask.goal -ceq $unicodeGoal) "Unicode task goal did not round-trip through UTF-8 standard input; expected=$expectedGoalCodes actual=$actualGoalCodes"
 
     $savedTeamEnvironment = $env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
     $env:CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = 'inherited'
@@ -531,6 +592,25 @@ exit /b 0
     $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
     $largeRecord = @($ledger.tasks)[-1]
     Assert-True ((Get-Content -Raw -LiteralPath $largeRecord.rawOutputPath).Length -gt 7000) 'large successful output was truncated'
+
+    $slowEofTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $slowEofTask.id = 'task-slow-eof'
+    $slowEofTask.limits.timeoutSeconds = 8
+    $slowEofPath = Join-Path $state.stateDir 'task-slow-eof.json'
+    $slowEofTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $slowEofPath -Encoding UTF8
+    $env:CLAUDE_FAKE_MODE = 'slow-eof'
+    $env:CLAUDE_FAKE_TASK = 'task-slow-eof'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $slowEofPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\CLAUDE_FAKE_TASK -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $slowEofRecord = @($ledger.tasks)[-1]
+    $slowEofOutput = Get-Content -Raw -LiteralPath $slowEofRecord.rawOutputPath
+    Assert-True (-not [bool]$slowEofRecord.timedOut) 'slow successful EOF was incorrectly timed out'
+    Assert-True ($slowEofOutput.Contains('delayed-eof-marker')) 'successful execution did not drain delayed output to EOF'
 
     $unsafeIdTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
     $unsafeIdTask.id = '../escape:star'

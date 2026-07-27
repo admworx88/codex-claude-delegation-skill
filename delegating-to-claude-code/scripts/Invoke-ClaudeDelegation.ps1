@@ -154,6 +154,18 @@ function Test-ForwardSubagentSupport([string]$VersionText) {
     return $version -ge [version]'2.1.211'
 }
 
+function ConvertTo-AsciiJson([string]$Json) {
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($character in $Json.ToCharArray()) {
+        if ([int]$character -gt 127) {
+            [void]$builder.AppendFormat('\u{0:X4}', [int]$character)
+        } else {
+            [void]$builder.Append($character)
+        }
+    }
+    return $builder.ToString()
+}
+
 function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwarding) {
     Assert-DelegationPolicy -Task $Task
     $schemaPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'references/result-schema.json'
@@ -163,8 +175,9 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
         'subagents' { 'Use focused Claude subagents for independent subtasks, then synthesize one result.' }
         'agent-team' { 'Create a small agent team from parallelWorkstreams. Enforce exclusive ownedPaths and stop all teammates before returning.' }
     }
+    $taskJson = ConvertTo-AsciiJson -Json ($Task | ConvertTo-Json -Depth 12)
     $prompt = "Execute the bounded task packet below. $modeDirective Do not commit, push, switch branches, modify remotes, or expand scope.`n`n" +
-              ($Task | ConvertTo-Json -Depth 12)
+              $taskJson
     $args = @('-p', '--dangerously-skip-permissions', '--output-format', 'json',
               '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
     $args += '--disallowedTools'
@@ -247,24 +260,27 @@ function Set-OwnerWaitState([string]$LedgerPath, $Task, [string]$Reason) {
 function Enter-TaskLock([string]$LockPath, [string]$TaskId) {
     $ownershipToken = [guid]::NewGuid().ToString('N')
     try {
-        $stream = [System.IO.File]::Open($LockPath, 'CreateNew', 'Write', 'None')
-        $writer = New-Object System.IO.StreamWriter($stream)
-        $writer.WriteLine("$ownershipToken`n$TaskId`n$PID`n$([DateTimeOffset]::UtcNow.ToString('o'))")
-        $writer.Dispose()
-        return $ownershipToken
+        $stream = New-Object System.IO.FileStream(
+            $LockPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::DeleteOnClose
+        )
+        $content = "$ownershipToken`n$TaskId`n$PID`n$([DateTimeOffset]::UtcNow.ToString('o'))`n"
+        $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($content)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+        return $stream
     } catch {
-        if ($null -ne $writer) { $writer.Dispose() }
-        elseif ($null -ne $stream) { $stream.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
         throw "Another Claude task is already running: $LockPath"
     }
 }
 
-function Exit-TaskLock([string]$LockPath, [string]$OwnershipToken) {
-    if (-not $OwnershipToken -or -not (Test-Path -LiteralPath $LockPath)) { return }
-    $recordedToken = Get-Content -LiteralPath $LockPath -TotalCount 1 -ErrorAction SilentlyContinue
-    if ($recordedToken -eq $OwnershipToken) {
-        Remove-Item -LiteralPath $LockPath -Force
-    }
+function Exit-TaskLock($LockHandle) {
+    if ($null -ne $LockHandle) { $LockHandle.Dispose() }
 }
 
 function Get-WorktreeFingerprint([string]$Worktree) {
@@ -370,6 +386,9 @@ function Invoke-ClaudeProcess(
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.RedirectStandardInput = $true
+    if ($null -ne $startInfo.PSObject.Properties['StandardInputEncoding']) {
+        $startInfo.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
     $startInfo.CreateNoWindow = $true
     foreach ($entry in $Invocation.environment.GetEnumerator()) {
         $startInfo.EnvironmentVariables[$entry.Key] = [string]$entry.Value
@@ -399,13 +418,11 @@ function Invoke-ClaudeProcess(
     $stdout = ''
     $stderr = ''
     $exitCode = $null
+    $inputError = $null
     try {
         $started = $process.Start()
-        if ($null -ne $Invocation.standardInput) {
-            $process.StandardInput.Write([string]$Invocation.standardInput)
-        }
-        $process.StandardInput.Close()
         $timeoutMilliseconds = [int][math]::Min([decimal][int]::MaxValue, $TimeoutSeconds * 1000)
+        $executionWatch = [System.Diagnostics.Stopwatch]::StartNew()
         $readers = @(
             [pscustomobject]@{
                 Reader = $process.StandardOutput
@@ -425,8 +442,20 @@ function Invoke-ClaudeProcess(
         foreach ($readerState in $readers) {
             $readerState.Task = $readerState.Reader.ReadAsync($readerState.Buffer, 0, $readerState.Buffer.Length)
         }
-        $executionWatch = [System.Diagnostics.Stopwatch]::StartNew()
-        while (-not $process.HasExited -and $executionWatch.ElapsedMilliseconds -lt $timeoutMilliseconds) {
+        $inputClosed = $false
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $inputWriteTask = if ($null -ne $Invocation.standardInput) {
+            $inputBytes = $utf8.GetBytes([string]$Invocation.standardInput)
+            $process.StandardInput.BaseStream.WriteAsync($inputBytes, 0, $inputBytes.Length)
+        } else {
+            $null
+        }
+        if ($null -eq $inputWriteTask) {
+            try { $process.StandardInput.BaseStream.Close() } catch { $inputError = $_.Exception.Message }
+            $inputClosed = $true
+        }
+
+        while ($executionWatch.ElapsedMilliseconds -lt $timeoutMilliseconds) {
             foreach ($readerState in $readers | Where-Object { -not $_.Complete -and $_.Task.IsCompleted }) {
                 try {
                     $count = $readerState.Task.GetAwaiter().GetResult()
@@ -440,41 +469,80 @@ function Invoke-ClaudeProcess(
                     $readerState.Complete = $true
                 }
             }
+            if (-not $inputClosed -and $inputWriteTask.IsCompleted) {
+                $inputWriteSucceeded = $false
+                try {
+                    $inputWriteTask.GetAwaiter().GetResult()
+                    $inputWriteSucceeded = $true
+                } catch {
+                    $inputError = $_.Exception.Message
+                }
+                try {
+                    $process.StandardInput.BaseStream.Close()
+                } catch {
+                    if (-not $inputWriteSucceeded -and -not $inputError) { $inputError = $_.Exception.Message }
+                }
+                $inputClosed = $true
+            }
+            if ($process.HasExited -and @($readers | Where-Object { -not $_.Complete }).Count -eq 0 -and $inputClosed) {
+                break
+            }
             [System.Threading.Thread]::Sleep(10)
         }
         $executionWatch.Stop()
-        if (-not $process.HasExited) {
+        $deadlineReached = -not ($process.HasExited -and @($readers | Where-Object { -not $_.Complete }).Count -eq 0 -and $inputClosed)
+        if ($deadlineReached) {
             $timedOut = $true
-            try {
-                $process.Kill()
-            } catch {
-                if (-not $process.HasExited) { throw }
+            if (-not $process.HasExited) {
+                try {
+                    $process.Kill()
+                } catch {
+                    if (-not $process.HasExited) { throw }
+                }
             }
         }
         if (-not $process.WaitForExit(2000)) {
             throw 'Claude process did not exit after termination.'
         }
-        $drainLimitMilliseconds = if ($timedOut) { 250 } else { 2000 }
-        $drainWatch = [System.Diagnostics.Stopwatch]::StartNew()
-        while (@($readers | Where-Object { -not $_.Complete }).Count -gt 0 -and $drainWatch.ElapsedMilliseconds -lt $drainLimitMilliseconds) {
-            foreach ($readerState in $readers | Where-Object { -not $_.Complete -and $_.Task.IsCompleted }) {
-                try {
-                    $count = $readerState.Task.GetAwaiter().GetResult()
-                    if ($count -eq 0) {
-                        $readerState.Complete = $true
-                    } else {
-                        [void]$readerState.Builder.Append($readerState.Buffer, 0, $count)
-                        $readerState.Task = $readerState.Reader.ReadAsync($readerState.Buffer, 0, $readerState.Buffer.Length)
-                    }
-                } catch {
-                    $readerState.Complete = $true
+        if ($timedOut) {
+            if (-not $inputClosed) {
+                try { $process.StandardInput.BaseStream.Close() } catch {
+                    if (-not $inputError) { $inputError = $_.Exception.Message }
                 }
+                if ($inputWriteTask.IsCompleted) {
+                    try { $inputWriteTask.GetAwaiter().GetResult() } catch {
+                        if (-not $inputError) { $inputError = $_.Exception.Message }
+                    }
+                } elseif (-not $inputError) {
+                    $inputError = 'Standard input did not complete before the invocation deadline.'
+                }
+                $inputClosed = $true
             }
-            [System.Threading.Thread]::Sleep(10)
+            $drainWatch = [System.Diagnostics.Stopwatch]::StartNew()
+            while (@($readers | Where-Object { -not $_.Complete }).Count -gt 0 -and $drainWatch.ElapsedMilliseconds -lt 250) {
+                foreach ($readerState in $readers | Where-Object { -not $_.Complete -and $_.Task.IsCompleted }) {
+                    try {
+                        $count = $readerState.Task.GetAwaiter().GetResult()
+                        if ($count -eq 0) {
+                            $readerState.Complete = $true
+                        } else {
+                            [void]$readerState.Builder.Append($readerState.Buffer, 0, $count)
+                            $readerState.Task = $readerState.Reader.ReadAsync($readerState.Buffer, 0, $readerState.Buffer.Length)
+                        }
+                    } catch {
+                        $readerState.Complete = $true
+                    }
+                }
+                [System.Threading.Thread]::Sleep(10)
+            }
+            $drainWatch.Stop()
         }
-        $drainWatch.Stop()
         $stdout = $readers[0].Builder.ToString()
         $stderr = $readers[1].Builder.ToString()
+        if ($inputError) {
+            if ($stderr.Length -gt 0) { $stderr += [Environment]::NewLine }
+            $stderr += "[standard-input] $inputError"
+        }
         $exitCode = $process.ExitCode
     } finally {
         if ($started -and -not $process.HasExited) {
@@ -494,6 +562,7 @@ function Invoke-ClaudeProcess(
         TimedOut = $timedOut
         StandardOutput = $stdout
         StandardError = $stderr
+        InputError = $inputError
         RawOutputPath = $RawOutputPath
         RawErrorPath = $RawErrorPath
     }
@@ -503,9 +572,9 @@ function Test-ClaudeResultContract($Result, $Task) {
     if ($null -eq $Result -or $Result -isnot [pscustomobject]) { return $false }
     $required = @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'unresolvedIssues', 'deviations')
     $names = @($Result.PSObject.Properties.Name)
-    if ($names.Count -ne $required.Count -or @($required | Where-Object { $names -notcontains $_ }).Count -gt 0) { return $false }
-    if ($Result.taskId -isnot [string] -or $Result.taskId -ne [string]$Task.id) { return $false }
-    if ($Result.status -isnot [string] -or @('completed', 'blocked', 'failed') -notcontains $Result.status) { return $false }
+    if ($names.Count -ne $required.Count -or @($required | Where-Object { $names -cnotcontains $_ }).Count -gt 0) { return $false }
+    if ($Result.taskId -isnot [string] -or -not [string]::Equals($Result.taskId, [string]$Task.id, [System.StringComparison]::Ordinal)) { return $false }
+    if ($Result.status -isnot [string] -or @('completed', 'blocked', 'failed') -cnotcontains $Result.status) { return $false }
     if ($Result.summary -isnot [string]) { return $false }
     foreach ($arrayName in @('changedFiles', 'tests', 'unresolvedIssues', 'deviations')) {
         if ($Result.$arrayName -isnot [System.Array]) { return $false }
@@ -517,17 +586,17 @@ function Test-ClaudeResultContract($Result, $Task) {
         if ($testResult -isnot [pscustomobject]) { return $false }
         $testNames = @($testResult.PSObject.Properties.Name)
         $allowedTestNames = @('command', 'outcome', 'details')
-        if ($testNames -notcontains 'command' -or $testNames -notcontains 'outcome' -or
-            @($testNames | Where-Object { $allowedTestNames -notcontains $_ }).Count -gt 0) {
+        if ($testNames -cnotcontains 'command' -or $testNames -cnotcontains 'outcome' -or
+            @($testNames | Where-Object { $allowedTestNames -cnotcontains $_ }).Count -gt 0) {
             return $false
         }
-        if ($testResult.command -isnot [string] -or @('passed', 'failed', 'not-run') -notcontains $testResult.outcome) { return $false }
-        if ($testNames -contains 'details' -and $testResult.details -isnot [string]) { return $false }
+        if ($testResult.command -isnot [string] -or @('passed', 'failed', 'not-run') -cnotcontains $testResult.outcome) { return $false }
+        if ($testNames -ccontains 'details' -and $testResult.details -isnot [string]) { return $false }
     }
     return $true
 }
 
-function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut, [int]$ExitCode) {
+function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut, [int]$ExitCode, [string]$InputError) {
     $envelope = $null
     if (-not $TimedOut) {
         foreach ($line in @($Output -split "`r?`n")) {
@@ -550,12 +619,15 @@ function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut, [int]
     if ($result -is [string]) {
         try { $result = $result | ConvertFrom-Json } catch { $result = $null }
     }
-    $valid = -not $TimedOut -and $ExitCode -eq 0 -and (Test-ClaudeResultContract -Result $result -Task $Task)
+    $valid = -not $TimedOut -and $ExitCode -eq 0 -and -not $InputError -and
+        (Test-ClaudeResultContract -Result $result -Task $Task)
     if (-not $valid) {
         $reason = if ($TimedOut) {
             'Claude execution timed out.'
         } elseif ($ExitCode -ne 0) {
             "Claude exited with code $ExitCode."
+        } elseif ($InputError) {
+            "Claude standard input failed: $InputError"
         } else {
             'Claude returned malformed or incomplete JSON.'
         }
@@ -595,9 +667,9 @@ function Get-ClaudeVersionSupport([string]$ClaudeCommand) {
 
 function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
     $lockAcquired = $false
-    $lockOwnershipToken = $null
+    $lockHandle = $null
     try {
-        $lockOwnershipToken = Enter-TaskLock -LockPath $State.lockPath -TaskId $Task.id
+        $lockHandle = Enter-TaskLock -LockPath $State.lockPath -TaskId $Task.id
         $lockAcquired = $true
 
         $startedAt = [DateTimeOffset]::UtcNow.ToString('o')
@@ -627,6 +699,7 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
                 resumed = $wasResumed
                 exitCode = $process.ExitCode
                 timedOut = $process.TimedOut
+                inputError = $process.InputError
                 rawOutputPath = $process.RawOutputPath
                 rawErrorPath = $process.RawErrorPath
             }
@@ -642,7 +715,8 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             }
         } while ($retryWithoutSession)
 
-        $parsed = ConvertFrom-ClaudeOutput -Output $process.StandardOutput -Task $Task -TimedOut $process.TimedOut -ExitCode $process.ExitCode
+        $parsed = ConvertFrom-ClaudeOutput -Output $process.StandardOutput -Task $Task -TimedOut $process.TimedOut `
+            -ExitCode $process.ExitCode -InputError $process.InputError
         $normalizedResultPath = Join-Path $State.stateDir "$runToken-result.json"
         $parsed.Result | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $normalizedResultPath -Encoding UTF8
 
@@ -700,7 +774,7 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         return $parsed.Result
     } finally {
         if ($lockAcquired) {
-            Exit-TaskLock -LockPath $State.lockPath -OwnershipToken $lockOwnershipToken
+            Exit-TaskLock -LockHandle $lockHandle
         }
     }
 }
