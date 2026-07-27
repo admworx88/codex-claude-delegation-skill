@@ -434,7 +434,47 @@ function Test-ClaudeAuthenticated([string]$Command) {
     }
 }
 
-function Show-OwnerSetup([string]$Worktree, [bool]$Installed) {
+function ConvertTo-PosixSingleQuotedString([string]$Value) {
+    return "'" + $Value.Replace("'", "'`"`"'`"`"'") + "'"
+}
+
+function New-MacOwnerSetupScriptContent([string]$Worktree, [bool]$Installed) {
+    $quotedWorktree = ConvertTo-PosixSingleQuotedString $Worktree
+    if ($Installed) {
+        return @"
+#!/bin/zsh
+cd -- $quotedWorktree
+printf '%s\n' 'Claude Code needs owner authentication. Claude will start now; enter /login and complete authentication.'
+if command -v claude >/dev/null 2>&1; then
+  claude
+else
+  printf '%s\n' 'Claude Code CLI is no longer available. Install it in this Terminal, then run claude and enter /login.'
+fi
+printf '%s\n' 'Interactive login shell ready. Close this Terminal window when finished.'
+exec "`${SHELL:-/bin/zsh}" -l
+"@
+    }
+    return @"
+#!/bin/zsh
+cd -- $quotedWorktree
+printf '%s\n' 'Claude Code CLI is not installed. Install Claude Code in this Terminal, then run claude and enter /login.'
+printf '%s\n' 'Installation help: https://code.claude.com/docs/en/setup'
+printf '%s\n' 'Interactive login shell ready. Install and authenticate here, then close this Terminal window.'
+exec "`${SHELL:-/bin/zsh}" -l
+"@
+}
+
+function New-OwnerSetupLaunchSpec(
+    [string]$Worktree,
+    [string]$StateDirectory,
+    [bool]$Installed,
+    [string]$Platform
+) {
+    $expectedStateDirectory = Join-Path $Worktree '.codex/claude-handoff'
+    if (-not (Test-CanonicalPathEqual -Left $StateDirectory -Right $expectedStateDirectory -Platform $Platform)) {
+        throw 'Owner setup state directory must be the canonical .codex/claude-handoff directory.'
+    }
+
     $message = if ($Installed) {
         "Claude Code needs owner authentication. Complete the login here; this window stays open at an interactive PowerShell prompt afterward. Close it when finished."
     } else {
@@ -447,7 +487,50 @@ function Show-OwnerSetup([string]$Worktree, [bool]$Installed) {
     } else {
         "Set-Location -LiteralPath '$escapedWorktree'; Write-Host '$escaped' -ForegroundColor Yellow; Read-Host 'Press Enter to reach the interactive PowerShell prompt' | Out-Null; Write-Host 'Interactive PowerShell prompt ready. Install Claude Code and authenticate here, then close this window.' -ForegroundColor Yellow"
     }
-    Start-Process powershell -ArgumentList @('-NoExit', '-NoProfile', '-Command', $command) -WorkingDirectory $Worktree | Out-Null
+
+    switch ($Platform) {
+        'Windows' {
+            return [pscustomobject]@{
+                FilePath = 'powershell'
+                ArgumentList = [object[]]@('-NoExit', '-NoProfile', '-Command', $command)
+                WorkingDirectory = $Worktree
+                ScriptPath = $null
+                ScriptContent = $null
+            }
+        }
+        'MacOS' {
+            $scriptPath = Join-Path $StateDirectory 'claude-owner-setup.command'
+            return [pscustomobject]@{
+                FilePath = 'open'
+                ArgumentList = [object[]]@('-a', 'Terminal', $scriptPath)
+                WorkingDirectory = $Worktree
+                ScriptPath = $scriptPath
+                ScriptContent = New-MacOwnerSetupScriptContent -Worktree $Worktree -Installed $Installed
+            }
+        }
+        default {
+            throw "Unsupported delegation platform: $Platform"
+        }
+    }
+}
+
+function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Installed) {
+    $platform = Get-DelegationPlatform
+    $launchSpec = New-OwnerSetupLaunchSpec -Worktree $Worktree -StateDirectory $StateDirectory `
+        -Installed $Installed -Platform $platform
+    if ($platform -eq 'MacOS') {
+        [System.IO.File]::WriteAllText(
+            $launchSpec.ScriptPath,
+            $launchSpec.ScriptContent,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        & chmod 700 -- $launchSpec.ScriptPath
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to secure owner setup script: $($launchSpec.ScriptPath)"
+        }
+    }
+    Start-Process -FilePath $launchSpec.FilePath -ArgumentList $launchSpec.ArgumentList `
+        -WorkingDirectory $launchSpec.WorkingDirectory | Out-Null
 }
 
 function Set-OwnerWaitState([string]$LedgerPath, $Task, [string]$Reason) {
@@ -1094,13 +1177,13 @@ if (-not $LibraryMode) {
     }
     if (-not (Test-ClaudeAvailable $ClaudeCommand)) {
         Set-OwnerWaitState -LedgerPath $state.ledgerPath -Task $task -Reason 'claude-cli-missing'
-        Show-OwnerSetup -Worktree $context.worktreePath -Installed $false
+        Show-OwnerSetup -Worktree $context.worktreePath -StateDirectory $state.stateDir -Installed $false
         throw 'Claude Code setup requires owner action.'
     }
     $resolvedClaudeCommand = Resolve-ClaudeCommandPath -Command $ClaudeCommand
     if (-not (Test-ClaudeAuthenticated $resolvedClaudeCommand)) {
         Set-OwnerWaitState -LedgerPath $state.ledgerPath -Task $task -Reason 'claude-authentication-required'
-        Show-OwnerSetup -Worktree $context.worktreePath -Installed $true
+        Show-OwnerSetup -Worktree $context.worktreePath -StateDirectory $state.stateDir -Installed $true
         throw 'Claude Code authentication requires owner action.'
     }
     Invoke-Delegation -Context $context -State $state -Task $task -ClaudeCommand $resolvedClaudeCommand | ConvertTo-Json -Depth 12

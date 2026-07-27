@@ -48,6 +48,104 @@ Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComp
 Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
 Assert-True (-not (Test-CanonicalPathEqual -Left '/Users/delegation/Task.json' -Right '/Users/delegation/task.json' -Platform 'MacOS')) 'macOS canonical paths must compare case-sensitively'
 
+$ownerSetupWindowsWorktree = 'C:\Delegation Worktree'
+$ownerSetupWindowsState = Join-Path $ownerSetupWindowsWorktree '.codex/claude-handoff'
+foreach ($installed in @($false, $true)) {
+    $windowsOwnerSetup = New-OwnerSetupLaunchSpec -Worktree $ownerSetupWindowsWorktree `
+        -StateDirectory $ownerSetupWindowsState -Installed $installed -Platform 'Windows'
+    Assert-True ($windowsOwnerSetup.FilePath -eq 'powershell') 'Windows owner setup must launch Windows PowerShell'
+    Assert-True ($windowsOwnerSetup.ArgumentList -contains '-NoExit') 'Windows owner setup must remain visible and interactive'
+    Assert-True ($windowsOwnerSetup.WorkingDirectory -eq $ownerSetupWindowsWorktree) 'Windows owner setup must use the worktree as its working directory'
+    Assert-True ((@($windowsOwnerSetup.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'Windows owner setup must not receive bypass permissions'
+}
+
+$ownerSetupMacWorktree = "/Users/Owner's Worktrees/Delegation Task"
+$ownerSetupMacState = Join-Path $ownerSetupMacWorktree '.codex/claude-handoff'
+$expectedQuotedMacWorktree = "'/Users/Owner'`"`"'`"`"'s Worktrees/Delegation Task'"
+Assert-True ((ConvertTo-PosixSingleQuotedString $ownerSetupMacWorktree) -ceq $expectedQuotedMacWorktree) 'macOS owner setup must safely POSIX-quote spaces and apostrophes'
+
+$missingMacOwnerSetup = New-OwnerSetupLaunchSpec -Worktree $ownerSetupMacWorktree `
+    -StateDirectory $ownerSetupMacState -Installed $false -Platform 'MacOS'
+$installedMacOwnerSetup = New-OwnerSetupLaunchSpec -Worktree $ownerSetupMacWorktree `
+    -StateDirectory $ownerSetupMacState -Installed $true -Platform 'MacOS'
+foreach ($macOwnerSetup in @($missingMacOwnerSetup, $installedMacOwnerSetup)) {
+    Assert-True ($macOwnerSetup.FilePath -eq 'open') 'macOS owner setup must use open'
+    Assert-True ($macOwnerSetup.ArgumentList.Count -eq 3) 'macOS owner setup must pass only the Terminal application and setup script'
+    Assert-True ($macOwnerSetup.ArgumentList[0] -eq '-a') 'macOS owner setup must select an application'
+    Assert-True ($macOwnerSetup.ArgumentList[1] -eq 'Terminal') 'macOS owner setup must launch Terminal'
+    Assert-True ($macOwnerSetup.ArgumentList[2] -eq $macOwnerSetup.ScriptPath) 'macOS Terminal must receive the generated setup script path'
+    Assert-True ([System.IO.Path]::GetExtension($macOwnerSetup.ScriptPath) -eq '.command') 'macOS owner setup script must use the .command extension'
+    Assert-True ((Split-Path -Parent $macOwnerSetup.ScriptPath) -eq $ownerSetupMacState) 'macOS owner setup script must stay under the handoff state directory'
+    Assert-True ($macOwnerSetup.ScriptContent -match [regex]::Escape("cd -- $expectedQuotedMacWorktree")) 'macOS owner setup script must safely change to the requested worktree'
+    Assert-True ($macOwnerSetup.ScriptContent -notmatch 'dangerously-skip-permissions') 'macOS owner setup script must not contain bypass permissions'
+}
+Assert-True ($missingMacOwnerSetup.ScriptContent -match 'Claude Code CLI is not installed') 'missing-Claude macOS setup must explain the install requirement'
+Assert-True ($missingMacOwnerSetup.ScriptContent -notmatch '(?m)^\s*claude(?:\s|$)') 'missing-Claude macOS setup must not invoke an unavailable Claude CLI'
+Assert-True ($missingMacOwnerSetup.ScriptContent -match '(?m)^exec "\$\{SHELL:-/bin/zsh\}" -l\s*$') 'missing-Claude macOS setup must end in an interactive login shell'
+Assert-True ($installedMacOwnerSetup.ScriptContent -match '(?m)^\s*claude\s*$') 'installed macOS setup must start Claude interactively'
+Assert-True ($installedMacOwnerSetup.ScriptContent -match '/login') 'installed macOS setup must direct the owner to /login'
+Assert-True ($installedMacOwnerSetup.ScriptContent -match '(?m)^exec "\$\{SHELL:-/bin/zsh\}" -l\s*$') 'installed macOS setup must leave an interactive login shell afterward'
+
+$macOwnerSetupRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-delegation-macos-owner-setup-' + [guid]::NewGuid())
+$macOwnerSetupState = Join-Path $macOwnerSetupRoot '.codex/claude-handoff'
+$macOwnerSetupBin = Join-Path $macOwnerSetupRoot 'bin'
+$macChmodCapturePath = Join-Path $macOwnerSetupRoot 'chmod-arguments.txt'
+$macOwnerSetupOriginalPlatform = ${function:Get-DelegationPlatform}
+$macOwnerSetupSavedPath = $env:PATH
+$global:capturedMacOwnerSetup = [ordered]@{
+    Launch = $null
+}
+try {
+    New-Item -ItemType Directory -Force -Path $macOwnerSetupState, $macOwnerSetupBin | Out-Null
+    @'
+@echo off
+echo %~1>"%CLAUDE_CHMOD_CAPTURE%"
+echo %~2>>"%CLAUDE_CHMOD_CAPTURE%"
+echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
+'@ | Set-Content -LiteralPath (Join-Path $macOwnerSetupBin 'chmod.cmd') -Encoding ASCII
+    $env:CLAUDE_CHMOD_CAPTURE = $macChmodCapturePath
+    $env:PATH = "$macOwnerSetupBin;$macOwnerSetupSavedPath"
+    Set-Item Function:\Get-DelegationPlatform -Value { return 'MacOS' }
+    function Start-Process {
+        param(
+            [string]$FilePath,
+            [object[]]$ArgumentList,
+            [string]$WorkingDirectory
+        )
+        $global:capturedMacOwnerSetup.Launch = [pscustomobject]@{
+            FilePath = $FilePath
+            ArgumentList = $ArgumentList
+            WorkingDirectory = $WorkingDirectory
+            ChmodCompleted = Test-Path -LiteralPath $macChmodCapturePath
+        }
+    }
+
+    Show-OwnerSetup -Worktree $macOwnerSetupRoot -StateDirectory $macOwnerSetupState -Installed $true
+
+    $writtenMacSetupPath = Join-Path $macOwnerSetupState 'claude-owner-setup.command'
+    Assert-True (Test-Path -LiteralPath $writtenMacSetupPath) 'macOS owner setup must write the generated command script before launch'
+    $writtenMacSetupBytes = [System.IO.File]::ReadAllBytes($writtenMacSetupPath)
+    $hasUtf8Bom = $writtenMacSetupBytes.Length -ge 3 -and $writtenMacSetupBytes[0] -eq 0xEF -and `
+        $writtenMacSetupBytes[1] -eq 0xBB -and $writtenMacSetupBytes[2] -eq 0xBF
+    Assert-True (-not $hasUtf8Bom) 'macOS owner setup script must be UTF-8 without BOM'
+    Assert-True $global:capturedMacOwnerSetup.Launch.ChmodCompleted 'macOS owner setup must secure the script before launching Terminal'
+    $capturedMacChmodArguments = @(Get-Content -LiteralPath $macChmodCapturePath)
+    Assert-True ($capturedMacChmodArguments.Count -eq 3) "macOS owner setup chmod must receive mode, option terminator, and exact path only: $($capturedMacChmodArguments -join '|')"
+    Assert-True ($capturedMacChmodArguments[0] -eq '700') 'macOS owner setup chmod must set mode 700'
+    Assert-True ($capturedMacChmodArguments[1] -eq '--') 'macOS owner setup chmod must use an option terminator'
+    Assert-True ($capturedMacChmodArguments[2] -ceq $writtenMacSetupPath) 'macOS owner setup chmod must receive the exact script path without shell interpolation'
+    Assert-True ($global:capturedMacOwnerSetup.Launch.FilePath -eq 'open') 'macOS owner setup execution must launch the inspected open specification'
+} finally {
+    Set-Item Function:\Get-DelegationPlatform -Value $macOwnerSetupOriginalPlatform
+    Remove-Item -Path Function:\Start-Process -Force -ErrorAction SilentlyContinue
+    $env:PATH = $macOwnerSetupSavedPath
+    Remove-Item Env:\CLAUDE_CHMOD_CAPTURE -ErrorAction SilentlyContinue
+    Remove-Variable -Name capturedMacOwnerSetup -Scope Global -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $macOwnerSetupRoot) {
+        Remove-Item -LiteralPath $macOwnerSetupRoot -Recurse -Force
+    }
+}
+
 $macFingerprintRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-delegation-macos-fingerprint-' + [guid]::NewGuid())
 $originalGetDelegationPlatform = ${function:Get-DelegationPlatform}
 $originalInvokeGit = ${function:Invoke-Git}
@@ -476,7 +574,7 @@ exit /b 0
         }
     }
     try {
-        Show-OwnerSetup -Worktree $linked -Installed $true
+        Show-OwnerSetup -Worktree $linked -StateDirectory $state.stateDir -Installed $true
         $installedSetup = $capturedStartProcess
         $installedSetupArguments = @($installedSetup.ArgumentList) -join ' '
         Assert-True ($installedSetup.FilePath -eq 'powershell') 'owner setup must launch Windows PowerShell'
@@ -486,7 +584,7 @@ exit /b 0
         Assert-True ($installedSetupArguments -notmatch 'dangerously-skip-permissions') 'owner setup received bypass permissions'
         Assert-True ($capturedStartProcess.WorkingDirectory -eq $linked) 'owner setup used the wrong working directory'
 
-        Show-OwnerSetup -Worktree $linked -Installed $false
+        Show-OwnerSetup -Worktree $linked -StateDirectory $state.stateDir -Installed $false
         $missingSetup = $capturedStartProcess
         $missingSetupArguments = @($missingSetup.ArgumentList) -join ' '
         Assert-True ($missingSetup.FilePath -eq 'powershell') 'missing setup must launch Windows PowerShell'
@@ -519,33 +617,40 @@ exit /b 0
     Assert-True $dryRunRejectedTamperedLedger 'dry-run proceeded with a mismatched ledger'
     Set-Content -LiteralPath $state.ledgerPath -Value $validLedgerJson -Encoding UTF8
 
-    $capturedStartProcess = $null
+    $global:capturedRunnerStartProcess = $null
     function Start-Process {
         param(
             [string]$FilePath,
             [object[]]$ArgumentList,
             [string]$WorkingDirectory
         )
-        $script:capturedStartProcess = [pscustomobject]@{
+        $ledgerAtLaunch = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+        $global:capturedRunnerStartProcess = [pscustomobject]@{
             FilePath = $FilePath
             ArgumentList = $ArgumentList
             WorkingDirectory = $WorkingDirectory
+            LedgerStatusAtLaunch = @($ledgerAtLaunch.tasks)[-1].status
         }
     }
     try {
         $missingSetupRejected = $false
+        $missingSetupError = $null
         try {
             & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand (Join-Path $fixtureRoot 'absent-claude.cmd') | Out-Null
         } catch {
             $missingSetupRejected = $true
+            $missingSetupError = $_
         }
         Assert-True $missingSetupRejected 'missing Claude CLI did not require owner setup'
         $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
         $missingWait = @($ledger.tasks)[-1]
         Assert-True ($missingWait.status -eq 'waiting-for-owner') 'missing CLI did not append owner wait state'
         Assert-True ($missingWait.reason -eq 'claude-cli-missing') 'missing CLI wait reason was incorrect'
-        Assert-True ((@($capturedStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'missing CLI setup received bypass permissions'
+        Assert-True ($null -ne $global:capturedRunnerStartProcess) "missing CLI did not open owner setup: $missingSetupError"
+        Assert-True ($global:capturedRunnerStartProcess.LedgerStatusAtLaunch -eq 'waiting-for-owner') 'missing CLI opened owner setup before recording owner wait state'
+        Assert-True ((@($global:capturedRunnerStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'missing CLI setup received bypass permissions'
 
+        $global:capturedRunnerStartProcess = $null
         $env:CLAUDE_FAKE_AUTH = 'false'
         $unauthenticatedRejected = $false
         try {
@@ -560,9 +665,12 @@ exit /b 0
         $authenticationWait = @($ledger.tasks)[-1]
         Assert-True ($authenticationWait.status -eq 'waiting-for-owner') 'unauthenticated CLI did not append owner wait state'
         Assert-True ($authenticationWait.reason -eq 'claude-authentication-required') 'authentication wait reason was incorrect'
-        Assert-True ((@($capturedStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'authentication setup received bypass permissions'
+        Assert-True ($null -ne $global:capturedRunnerStartProcess) 'unauthenticated Claude did not open owner setup'
+        Assert-True ($global:capturedRunnerStartProcess.LedgerStatusAtLaunch -eq 'waiting-for-owner') 'unauthenticated Claude opened owner setup before recording owner wait state'
+        Assert-True ((@($global:capturedRunnerStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'authentication setup received bypass permissions'
     } finally {
         Remove-Item -Path Function:\Start-Process -Force
+        Remove-Variable -Name capturedRunnerStartProcess -Scope Global -ErrorAction SilentlyContinue
     }
 
     $namedFakeClaude = Join-Path $fixtureRoot 'fake-claude-name.cmd'
