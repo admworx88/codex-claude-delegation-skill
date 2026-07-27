@@ -1,0 +1,16 @@
+{
+  "id": "task-001",
+  "goal": "Implement the password-reset API endpoint.",
+  "mode": "direct",
+  "allowedPaths": ["src/auth/**", "tests/auth/**"],
+  "forbiddenPaths": [".git/**", ".github/**", ".env*"],
+  "forbiddenActions": ["git commit", "git push", "git checkout", "git switch", "git remote"],
+  "context": ["Codex owns acceptance and repository history."],
+  "acceptanceCriteria": ["Unknown emails receive a generic response.", "Tokens expire after 30 minutes."],
+  "requiredVerification": ["Run the focused authentication test suite."],
+  "limits": {
+    "maxTurns": 30,
+    "timeoutSeconds": 1800,
+    "maxBudgetUsd": 5.0
+  }
+}

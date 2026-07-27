@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to Claude Code"
+  short_description: "Safely orchestrate Claude Code CLI tasks"
+  default_prompt: "Use $delegating-to-claude-code to delegate this implementation safely to Claude Code."
