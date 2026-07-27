@@ -67,3 +67,83 @@ function Initialize-HandoffState($Context) {
         lockPath = Join-Path $stateDir 'running.lock'
     }
 }
+
+function Read-TaskPacket([string]$Path) {
+    $resolved = Resolve-AbsolutePath $Path
+    $task = Get-Content -Raw -LiteralPath $resolved | ConvertFrom-Json
+    foreach ($name in @('id', 'goal', 'mode', 'allowedPaths', 'forbiddenPaths', 'forbiddenActions', 'acceptanceCriteria', 'requiredVerification', 'limits')) {
+        if ($null -eq $task.$name) { throw "Task packet missing required field: $name" }
+    }
+    Assert-DelegationPolicy -Task $task
+    return $task
+}
+
+function Test-PathPatternOverlap([string]$Left, [string]$Right) {
+    $a = $Left.TrimEnd('*', '/', '\')
+    $b = $Right.TrimEnd('*', '/', '\')
+    return $a.StartsWith($b, [System.StringComparison]::OrdinalIgnoreCase) -or
+           $b.StartsWith($a, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-DelegationPolicy($Task) {
+    if (@('direct', 'subagents', 'agent-team') -notcontains $Task.mode) { throw "Unsupported mode: $($Task.mode)" }
+    if ($Task.mode -ne 'agent-team') { return }
+
+    $workstreams = @($Task.parallelWorkstreams)
+    if ($workstreams.Count -lt 2) { throw 'Agent-team mode requires at least two workstreams.' }
+    for ($i = 0; $i -lt $workstreams.Count; $i++) {
+        if ($null -eq $workstreams[$i].ownedPaths -or @($workstreams[$i].ownedPaths).Count -eq 0) {
+            throw "Agent-team workstream $i must declare ownedPaths."
+        }
+        for ($j = $i + 1; $j -lt $workstreams.Count; $j++) {
+            if ($null -eq $workstreams[$j].ownedPaths -or @($workstreams[$j].ownedPaths).Count -eq 0) {
+                throw "Agent-team workstream $j must declare ownedPaths."
+            }
+            foreach ($left in $workstreams[$i].ownedPaths) {
+                foreach ($right in $workstreams[$j].ownedPaths) {
+                    if (Test-PathPatternOverlap $left $right) { throw "Overlapping ownership: $left and $right" }
+                }
+            }
+        }
+    }
+}
+
+function Test-ForwardSubagentSupport([string]$VersionText) {
+    $match = [regex]::Match($VersionText, '(\d+)\.(\d+)\.(\d+)')
+    if (-not $match.Success) { return $false }
+    $version = New-Object System.Version -ArgumentList @(
+        [int]$match.Groups[1].Value,
+        [int]$match.Groups[2].Value,
+        [int]$match.Groups[3].Value
+    )
+    return $version -ge [version]'2.1.211'
+}
+
+function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwarding) {
+    Assert-DelegationPolicy -Task $Task
+    $schemaPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'references/result-schema.json'
+    $schema = (Get-Content -Raw -LiteralPath $schemaPath).Trim()
+    $modeDirective = switch ($Task.mode) {
+        'direct' { 'Work directly. Do not spawn subagents or teammates.' }
+        'subagents' { 'Use focused Claude subagents for independent subtasks, then synthesize one result.' }
+        'agent-team' { 'Create a small agent team from parallelWorkstreams. Enforce exclusive ownedPaths and stop all teammates before returning.' }
+    }
+    $prompt = "Execute the bounded task packet below. $modeDirective Do not commit, push, switch branches, modify remotes, or expand scope.`n`n" +
+              ($Task | ConvertTo-Json -Depth 12)
+    $args = @('-p', $prompt, '--dangerously-skip-permissions', '--output-format', 'json',
+              '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
+    $args += '--disallowedTools'
+    $args += @('Bash(git *)', 'Bash(git.exe *)')
+
+    $environment = @{}
+    $fresh = $Task.mode -eq 'agent-team'
+    if (-not $fresh -and $SessionId) { $args += @('--resume', $SessionId) }
+    if ($Task.limits.maxBudgetUsd) { $args += @('--max-budget-usd', [string]$Task.limits.maxBudgetUsd) }
+    if ($Task.mode -ne 'direct' -and $SupportsForwarding) {
+        $outputIndex = [Array]::IndexOf([object[]]$args, '--output-format')
+        $args[$outputIndex + 1] = 'stream-json'
+        $args += @('--verbose', '--forward-subagent-text')
+    }
+    if ($fresh) { $environment['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS'] = '1' }
+    [pscustomobject]@{ arguments = [object[]]$args; environment = $environment; freshSession = $fresh }
+}

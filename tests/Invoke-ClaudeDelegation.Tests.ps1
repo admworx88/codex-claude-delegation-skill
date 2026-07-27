@@ -43,6 +43,59 @@ foreach ($field in @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'un
 $Runner = Join-Path $RepoRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1'
 . $Runner -LibraryMode
 
+$parsedExample = Read-TaskPacket -Path $TaskExample
+Assert-True ($parsedExample.id -eq 'task-001') 'task packet reader did not return the parsed packet'
+
+$direct = [pscustomobject]@{
+    id='task-direct'; goal='Fix one parser'; mode='direct'
+    allowedPaths=@('src/parser.ps1'); forbiddenPaths=@('.git/**')
+    forbiddenActions=@('git commit'); context=@()
+    acceptanceCriteria=@('Focused tests pass'); requiredVerification=@('Run parser tests')
+    limits=[pscustomobject]@{ maxTurns=20; timeoutSeconds=900; maxBudgetUsd=3.0 }
+}
+$directInvocation = New-ClaudeInvocation -Task $direct -SessionId 'session-123' -SupportsForwarding $true
+Assert-True ($directInvocation.arguments -contains '--resume') 'direct mode must resume primary session'
+Assert-True (-not $directInvocation.environment.ContainsKey('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS')) 'direct mode enabled teams'
+Assert-True ($directInvocation.arguments -contains 'Bash(git *)') 'git deny rule missing'
+Assert-True ($directInvocation.arguments -contains 'Bash(git.exe *)') 'git.exe deny rule missing'
+Assert-True ($directInvocation.arguments -contains '--output-format') 'output-format flag missing'
+Assert-True ($directInvocation.arguments[[Array]::IndexOf([object[]]$directInvocation.arguments, '--output-format') + 1] -eq 'json') 'direct mode output must remain JSON'
+
+$subagents = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$subagents.mode = 'subagents'
+$subagentInvocation = New-ClaudeInvocation -Task $subagents -SessionId 'session-123' -SupportsForwarding $true
+Assert-True (-not $subagentInvocation.freshSession) 'subagents mode must reuse the primary session'
+Assert-True ($subagentInvocation.arguments -contains '--resume') 'subagents mode must resume primary session'
+Assert-True ($subagentInvocation.arguments -contains '--forward-subagent-text') 'subagents forwarding missing'
+Assert-True ($subagentInvocation.arguments[[Array]::IndexOf([object[]]$subagentInvocation.arguments, '--output-format') + 1] -eq 'stream-json') 'subagents mode must use stream JSON when forwarding'
+$subagentWithoutForwarding = New-ClaudeInvocation -Task $subagents -SessionId 'session-123' -SupportsForwarding $false
+Assert-True (-not ($subagentWithoutForwarding.arguments -contains '--forward-subagent-text')) 'unsupported versions must not receive forwarding'
+Assert-True ($subagentWithoutForwarding.arguments[[Array]::IndexOf([object[]]$subagentWithoutForwarding.arguments, '--output-format') + 1] -eq 'json') 'unsupported versions must retain JSON output'
+
+$team = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$team.mode = 'agent-team'
+$team | Add-Member -NotePropertyName parallelWorkstreams -NotePropertyValue @(
+    [pscustomobject]@{ name='api'; ownedPaths=@('src/api/**') },
+    [pscustomobject]@{ name='ui'; ownedPaths=@('src/ui/**') }
+)
+$teamInvocation = New-ClaudeInvocation -Task $team -SessionId 'session-123' -SupportsForwarding $true
+Assert-True ($teamInvocation.freshSession) 'team mode must use a fresh session'
+Assert-True ($teamInvocation.environment['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS'] -eq '1') 'team env missing'
+Assert-True ($teamInvocation.arguments -contains '--forward-subagent-text') 'stream forwarding missing'
+Assert-True (-not ($teamInvocation.arguments -contains '--resume')) 'team mode must not resume a prior session'
+Assert-True (Test-ForwardSubagentSupport -VersionText '2.1.211 (Claude Code)') 'supported forwarding version rejected'
+Assert-True (-not (Test-ForwardSubagentSupport -VersionText '2.1.210 (Claude Code)')) 'unsupported forwarding version accepted'
+Assert-True (-not (Test-ForwardSubagentSupport -VersionText 'invalid')) 'invalid forwarding version accepted'
+
+$overlap = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$overlap.parallelWorkstreams = @(
+    [pscustomobject]@{ name='one'; ownedPaths=@('src/**') },
+    [pscustomobject]@{ name='two'; ownedPaths=@('src/api/**') }
+)
+$rejected = $false
+try { Assert-DelegationPolicy -Task $overlap } catch { $rejected = $true }
+Assert-True $rejected 'overlapping team ownership must be rejected'
+
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-delegation-" + [guid]::NewGuid())
 $mainRepo = Join-Path $fixtureRoot 'main'
 $linked = Join-Path $fixtureRoot 'feature'
