@@ -202,6 +202,214 @@ try {
     Assert-True ($ledger.branch -eq $linkedContext.branch) 'ledger branch mismatch'
     Assert-True (@($ledger.tasks).Count -eq 0) 'new ledger tasks must be empty'
 
+    $fakeClaude = Join-Path $fixtureRoot 'fake-claude.cmd'
+    @'
+@echo off
+if not "%1"=="auth" goto version
+if not "%2"=="status" goto version
+echo {"loggedIn":true}
+exit /b 0
+:version
+if not "%1"=="--version" goto modes
+echo 2.1.211 ^(Claude Code^)
+exit /b 0
+:modes
+if "%CLAUDE_FAKE_MODE%"=="malformed" (
+  echo not-json
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="timeout" (
+  ping 127.0.0.1 -n 6 >nul
+  exit /b 0
+)
+if "%CLAUDE_FAKE_MODE%"=="allowed-edit" (
+  echo delegated-change>>"%CD%\src\parser.ps1"
+)
+if "%CLAUDE_FAKE_MODE%"=="forbidden-edit" (
+  if not exist "%CD%\.github\workflows" mkdir "%CD%\.github\workflows"
+  echo forbidden>"%CD%\.github\workflows\ci.yml"
+)
+if "%CLAUDE_FAKE_MODE%"=="remote-change" (
+  git -C "%CD%" remote add delegation-evil https://example.invalid/evil.git
+)
+if not "%CLAUDE_FAKE_MODE%"=="missing-session" goto output
+if exist "%CD%\.codex\claude-handoff\missing-session-attempted" goto output
+echo attempted>"%CD%\.codex\claude-handoff\missing-session-attempted"
+echo session not found 1>&2
+exit /b 1
+:output
+set TASK_ID=%CLAUDE_FAKE_TASK%
+if "%TASK_ID%"=="" set TASK_ID=task-direct
+set SESSION_ID=%CLAUDE_FAKE_SESSION%
+if "%SESSION_ID%"=="" set SESSION_ID=fake-session
+echo {"type":"result","session_id":"%SESSION_ID%","result":{"taskId":"%TASK_ID%","status":"completed","summary":"done","changedFiles":[],"tests":[],"unresolvedIssues":[],"deviations":[]}}
+exit /b 0
+'@ | Set-Content -LiteralPath $fakeClaude -Encoding ASCII
+
+    Assert-True (Test-ClaudeAvailable $fakeClaude) 'fake Claude command was not detected'
+    Assert-True (Test-ClaudeAuthenticated $fakeClaude) 'fake Claude authentication was not detected'
+    Assert-True (-not (Test-ClaudeAuthenticated (Join-Path $fixtureRoot 'missing-claude.cmd'))) 'missing Claude command was treated as authenticated'
+
+    $capturedStartProcess = $null
+    function Start-Process {
+        param(
+            [string]$FilePath,
+            [object[]]$ArgumentList,
+            [string]$WorkingDirectory
+        )
+        $script:capturedStartProcess = [pscustomobject]@{
+            FilePath = $FilePath
+            ArgumentList = $ArgumentList
+            WorkingDirectory = $WorkingDirectory
+        }
+    }
+    try {
+        Show-OwnerSetup -Worktree $linked -Installed $true
+        $setupArguments = @($capturedStartProcess.ArgumentList) -join ' '
+        Assert-True ($setupArguments -match 'claude auth login') 'owner setup did not offer authentication'
+        Assert-True ($setupArguments -notmatch 'dangerously-skip-permissions') 'owner setup received bypass permissions'
+        Assert-True ($capturedStartProcess.WorkingDirectory -eq $linked) 'owner setup used the wrong working directory'
+    } finally {
+        Remove-Item -Path Function:\Start-Process -Force
+    }
+
+    New-Item -ItemType Directory -Force -Path (Join-Path $linked 'src') | Out-Null
+    Set-Content -LiteralPath (Join-Path $linked 'src/parser.ps1') -Value 'dirty-before-delegation'
+    $executionTask = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $executionTask.forbiddenPaths = @('.git/**', '.github/**')
+    $taskPath = Join-Path $state.stateDir 'task-direct.json'
+    $executionTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $taskPath -Encoding UTF8
+
+    $successJson = (& $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-String).Trim()
+    $successResult = $successJson | ConvertFrom-Json
+    Assert-True ($successResult.taskId -eq 'task-direct') 'runner did not return normalized task JSON'
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $successRecord = @($ledger.tasks)[-1]
+    $successRawOutput = Get-Content -Raw -LiteralPath $successRecord.rawOutputPath
+    $successRawError = Get-Content -Raw -LiteralPath $successRecord.rawErrorPath
+    Assert-True ($ledger.primarySessionId -eq 'fake-session') "session ID was not persisted; exit: $($successRecord.exitCode); raw output: $successRawOutput; raw error: $successRawError"
+    Assert-True ($successRecord.status -eq 'needs-review') 'Claude completion must require Codex review'
+    Assert-True (Test-Path -LiteralPath $successRecord.rawOutputPath) 'raw output was not captured'
+    Assert-True (Test-Path -LiteralPath $successRecord.rawErrorPath) 'raw error was not captured'
+    Assert-True (Test-Path -LiteralPath $successRecord.resultPath) 'normalized result was not captured'
+    Assert-True (@($successRecord.attempts).Count -eq 1) 'successful execution must record one attempt'
+
+    $lockPath = $state.lockPath
+    Set-Content -LiteralPath $lockPath -Value 'busy'
+    $locked = $false
+    try { & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null } catch { $locked = $true }
+    Assert-True $locked 'concurrent task lock was not enforced'
+    Assert-True (Test-Path -LiteralPath $lockPath) 'runner removed a lock it did not own'
+    Remove-Item -LiteralPath $lockPath -Force
+
+    $env:CLAUDE_FAKE_MODE = 'malformed'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $malformedRecord = @($ledger.tasks)[-1]
+    Assert-True ($malformedRecord.status -eq 'needs-review') 'malformed output must require review'
+    Assert-True ((Get-Content -Raw -LiteralPath $malformedRecord.rawOutputPath).Trim() -eq 'not-json') 'malformed raw output was not retained'
+
+    $timeoutTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $timeoutTask.id = 'task-timeout'
+    $timeoutTask.limits.timeoutSeconds = 1
+    $timeoutPath = Join-Path $state.stateDir 'task-timeout.json'
+    $timeoutTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $timeoutPath -Encoding UTF8
+    $env:CLAUDE_FAKE_MODE = 'timeout'
+    $env:CLAUDE_FAKE_TASK = 'task-timeout'
+    $timeoutStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $timeoutPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        $timeoutStopwatch.Stop()
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\CLAUDE_FAKE_TASK -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $timeoutRecord = @($ledger.tasks)[-1]
+    Assert-True ($timeoutRecord.status -eq 'needs-review') 'timeout must require review'
+    Assert-True ([bool]$timeoutRecord.attempts[0].timedOut) 'timeout attempt was not identified'
+    Assert-True ($timeoutStopwatch.Elapsed.TotalSeconds -lt 4) 'timeout waited for a descendant that inherited the output pipe'
+
+    $beforeFingerprint = Get-WorktreeFingerprint -Worktree $linked
+    Add-Content -LiteralPath (Join-Path $linked 'src/parser.ps1') -Value 'second-change'
+    $afterFingerprint = Get-WorktreeFingerprint -Worktree $linked
+    $fingerprintChanges = Compare-WorktreeFingerprint -Before $beforeFingerprint -After $afterFingerprint
+    Assert-True ($fingerprintChanges -contains 'src/parser.ps1') 'hash fingerprint missed a second change to an already dirty file'
+
+    $env:CLAUDE_FAKE_MODE = 'allowed-edit'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $allowedRecord = @($ledger.tasks)[-1]
+    Assert-True ($allowedRecord.changedDuringTask -contains 'src/parser.ps1') 'runner missed a change to an already dirty allowed file'
+    Assert-True (@($allowedRecord.scopeViolations).Count -eq 0) 'allowed path was rejected'
+
+    $scopeViolations = Get-ScopeViolations -ChangedPaths @('.github/workflows/ci.yml', 'src/parser.ps1') -Task $executionTask
+    Assert-True ($scopeViolations -contains '.github/workflows/ci.yml') 'forbidden path was not detected'
+    Assert-True (-not ($scopeViolations -contains 'src/parser.ps1')) 'allowed path was rejected by the scope helper'
+
+    $env:CLAUDE_FAKE_MODE = 'forbidden-edit'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $forbiddenRecord = @($ledger.tasks)[-1]
+    Assert-True ($forbiddenRecord.status -eq 'rejected') 'scope violation was not rejected'
+    Assert-True ($forbiddenRecord.scopeViolations -contains '.github/workflows/ci.yml') 'scope violation was not recorded'
+    Assert-True (Test-Path -LiteralPath (Join-Path $linked '.github/workflows/ci.yml')) 'runner automatically reverted a rejected change'
+
+    $env:CLAUDE_FAKE_MODE = 'remote-change'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $repositoryRecord = @($ledger.tasks)[-1]
+    Assert-True ($repositoryRecord.status -eq 'rejected') 'remote mutation was not rejected'
+    Assert-True ($repositoryRecord.repositoryViolations -contains 'remotes-changed') 'remote mutation was not recorded'
+    $fixtureRemotes = Invoke-TestGit $linked @('remote')
+    Assert-True ($fixtureRemotes -contains 'delegation-evil') 'runner automatically reverted a remote mutation'
+
+    $env:CLAUDE_FAKE_MODE = 'missing-session'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $retryRecord = @($ledger.tasks)[-1]
+    Assert-True (@($retryRecord.attempts).Count -eq 2) 'missing session was not retried exactly once'
+    Assert-True ($retryRecord.attempts[0].exitCode -ne 0) 'missing-session attempt did not retain its failure'
+    Assert-True ($retryRecord.attempts[1].exitCode -eq 0) 'fresh retry did not succeed'
+    Assert-True ($ledger.primarySessionId -eq 'fake-session') 'fresh retry session was not persisted'
+
+    $teamExecutionTask = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $teamExecutionTask.id = 'task-team'
+    $teamTaskPath = Join-Path $state.stateDir 'task-team.json'
+    $teamExecutionTask | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $teamTaskPath -Encoding UTF8
+    $env:CLAUDE_FAKE_TASK = 'task-team'
+    $env:CLAUDE_FAKE_SESSION = 'team-session'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $teamTaskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_TASK -ErrorAction SilentlyContinue
+        Remove-Item Env:\CLAUDE_FAKE_SESSION -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $teamRecord = @($ledger.tasks)[-1]
+    Assert-True ($teamRecord.sessionId -eq 'team-session') 'team session was not recorded on its task'
+    Assert-True ($ledger.primarySessionId -eq 'fake-session') 'team session replaced the primary session'
+
     Invoke-TestGit $linked @('checkout', '--detach') | Out-Null
     $detachedContext = Get-WorktreeContext -WorktreePath $linked
     $detachedRejected = $false
