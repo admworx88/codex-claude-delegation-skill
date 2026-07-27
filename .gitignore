@@ -1,0 +1,5 @@
+.worktrees/
+.superpowers/
+.codex/claude-handoff/
+*.tmp
+*.log
