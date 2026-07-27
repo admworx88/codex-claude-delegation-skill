@@ -39,6 +39,8 @@ completed diagnosis.
 
 - Selects `direct` for the small, tightly coupled one-file change.
 - Creates or uses a linked feature worktree rather than the current checkout.
+- Adds the handoff ignore entry while preserving every existing `.gitignore`
+  entry.
 - Uses the validated delegation runner before bypass permissions are allowed.
 - Keeps Codex responsible for diff review, independent test rerun, acceptance,
   and later repository-history actions.

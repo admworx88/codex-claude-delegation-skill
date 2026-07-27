@@ -29,7 +29,7 @@ required.
 ## Initialize the local ledger
 
 In the linked worktree, create `.codex/claude-handoff/` and ensure the root
-`.gitignore` contains exactly:
+`.gitignore` contains this exact entry, preserving every existing entry:
 
 ```gitignore
 .codex/claude-handoff/
