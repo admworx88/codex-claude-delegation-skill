@@ -91,9 +91,11 @@ $macOwnerSetupState = Join-Path $macOwnerSetupRoot '.codex/claude-handoff'
 $macOwnerSetupBin = Join-Path $macOwnerSetupRoot 'bin'
 $macChmodCapturePath = Join-Path $macOwnerSetupRoot 'chmod-arguments.txt'
 $macOwnerSetupOriginalPlatform = ${function:Get-DelegationPlatform}
+$macOwnerSetupOriginalLaunch = ${function:Invoke-OwnerSetupLaunchSpec}
 $macOwnerSetupSavedPath = $env:PATH
 $global:capturedMacOwnerSetup = [ordered]@{
     Launch = $null
+    LaunchPlatform = $null
 }
 try {
     New-Item -ItemType Directory -Force -Path $macOwnerSetupState, $macOwnerSetupBin | Out-Null
@@ -106,18 +108,13 @@ echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
     $env:CLAUDE_CHMOD_CAPTURE = $macChmodCapturePath
     $env:PATH = "$macOwnerSetupBin;$macOwnerSetupSavedPath"
     Set-Item Function:\Get-DelegationPlatform -Value { return 'MacOS' }
+    function Invoke-OwnerSetupLaunchSpec {
+        param($LaunchSpec, [string]$Platform)
+        $global:capturedMacOwnerSetup.Launch = $LaunchSpec
+        $global:capturedMacOwnerSetup.LaunchPlatform = $Platform
+    }
     function Start-Process {
-        param(
-            [string]$FilePath,
-            [object[]]$ArgumentList,
-            [string]$WorkingDirectory
-        )
-        $global:capturedMacOwnerSetup.Launch = [pscustomobject]@{
-            FilePath = $FilePath
-            ArgumentList = $ArgumentList
-            WorkingDirectory = $WorkingDirectory
-            ChmodCompleted = Test-Path -LiteralPath $macChmodCapturePath
-        }
+        throw 'macOS owner setup must not use Start-Process because it flattens native argument boundaries.'
     }
 
     Show-OwnerSetup -Worktree $macOwnerSetupRoot -StateDirectory $macOwnerSetupState -Installed $true
@@ -128,21 +125,82 @@ echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
     $hasUtf8Bom = $writtenMacSetupBytes.Length -ge 3 -and $writtenMacSetupBytes[0] -eq 0xEF -and `
         $writtenMacSetupBytes[1] -eq 0xBB -and $writtenMacSetupBytes[2] -eq 0xBF
     Assert-True (-not $hasUtf8Bom) 'macOS owner setup script must be UTF-8 without BOM'
-    Assert-True $global:capturedMacOwnerSetup.Launch.ChmodCompleted 'macOS owner setup must secure the script before launching Terminal'
+    Assert-True (Test-Path -LiteralPath $macChmodCapturePath) 'macOS owner setup must secure the script before launching Terminal'
     $capturedMacChmodArguments = @(Get-Content -LiteralPath $macChmodCapturePath)
     Assert-True ($capturedMacChmodArguments.Count -eq 3) "macOS owner setup chmod must receive mode, option terminator, and exact path only: $($capturedMacChmodArguments -join '|')"
     Assert-True ($capturedMacChmodArguments[0] -eq '700') 'macOS owner setup chmod must set mode 700'
     Assert-True ($capturedMacChmodArguments[1] -eq '--') 'macOS owner setup chmod must use an option terminator'
     Assert-True ($capturedMacChmodArguments[2] -ceq $writtenMacSetupPath) 'macOS owner setup chmod must receive the exact script path without shell interpolation'
     Assert-True ($global:capturedMacOwnerSetup.Launch.FilePath -eq 'open') 'macOS owner setup execution must launch the inspected open specification'
+    Assert-True ($global:capturedMacOwnerSetup.LaunchPlatform -eq 'MacOS') 'macOS owner setup must use the argv-preserving macOS launch seam'
 } finally {
     Set-Item Function:\Get-DelegationPlatform -Value $macOwnerSetupOriginalPlatform
+    if ($null -ne $macOwnerSetupOriginalLaunch) {
+        Set-Item Function:\Invoke-OwnerSetupLaunchSpec -Value $macOwnerSetupOriginalLaunch
+    } else {
+        Remove-Item -Path Function:\Invoke-OwnerSetupLaunchSpec -Force -ErrorAction SilentlyContinue
+    }
     Remove-Item -Path Function:\Start-Process -Force -ErrorAction SilentlyContinue
     $env:PATH = $macOwnerSetupSavedPath
     Remove-Item Env:\CLAUDE_CHMOD_CAPTURE -ErrorAction SilentlyContinue
     Remove-Variable -Name capturedMacOwnerSetup -Scope Global -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $macOwnerSetupRoot) {
         Remove-Item -LiteralPath $macOwnerSetupRoot -Recurse -Force
+    }
+}
+
+$argumentListProperty = [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')
+if ($null -eq $argumentListProperty) {
+    $macLaunchRejectedOnLegacyPowerShell = $false
+    try {
+        Invoke-OwnerSetupLaunchSpec -LaunchSpec ([pscustomobject]@{
+            FilePath = 'open'
+            ArgumentList = [object[]]@('-a', 'Terminal', "/tmp/Owner's Delegation Task.command")
+            WorkingDirectory = '/tmp'
+        }) -Platform 'MacOS' | Out-Null
+    } catch {
+        $macLaunchRejectedOnLegacyPowerShell = $_.Exception.Message -match 'PowerShell 7|ArgumentList'
+    }
+    Assert-True $macLaunchRejectedOnLegacyPowerShell 'legacy PowerShell must reject macOS launch instead of flattening argument boundaries'
+} else {
+    $argvProbeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-delegation-argv-probe-' + [guid]::NewGuid())
+    try {
+        New-Item -ItemType Directory -Force -Path $argvProbeRoot | Out-Null
+        $argvProbeScript = Join-Path $argvProbeRoot 'capture argv.ps1'
+        $argvProbeOutput = Join-Path $argvProbeRoot 'captured argv.json'
+        @'
+param([string]$OutputPath)
+[System.IO.File]::WriteAllText(
+    $OutputPath,
+    (@($args) | ConvertTo-Json -Compress),
+    [System.Text.UTF8Encoding]::new($false)
+)
+'@ | Set-Content -LiteralPath $argvProbeScript -Encoding UTF8
+        $expectedSpacedScriptPath = Join-Path $argvProbeRoot "Owner's Delegation Task.command"
+        $argvProbeLaunch = [pscustomobject]@{
+            FilePath = (Get-Process -Id $PID).Path
+            ArgumentList = [object[]]@(
+                '-NoProfile', '-File', $argvProbeScript, $argvProbeOutput,
+                '-a', 'Terminal', $expectedSpacedScriptPath
+            )
+            WorkingDirectory = $argvProbeRoot
+        }
+        $argvProbeProcess = Invoke-OwnerSetupLaunchSpec -LaunchSpec $argvProbeLaunch -Platform 'MacOS'
+        try {
+            Assert-True ($argvProbeProcess.WaitForExit(30000)) 'argv probe process did not exit'
+            Assert-True ($argvProbeProcess.ExitCode -eq 0) 'argv probe process failed'
+        } finally {
+            $argvProbeProcess.Dispose()
+        }
+        $capturedArgv = @(Get-Content -Raw -LiteralPath $argvProbeOutput | ConvertFrom-Json)
+        Assert-True ($capturedArgv.Count -eq 3) 'macOS argv-preserving launch changed the native argument count'
+        Assert-True ($capturedArgv[0] -eq '-a') 'macOS argv-preserving launch changed the application selector'
+        Assert-True ($capturedArgv[1] -eq 'Terminal') 'macOS argv-preserving launch changed the Terminal application name'
+        Assert-True ($capturedArgv[2] -ceq $expectedSpacedScriptPath) 'macOS argv-preserving launch split or changed the spaced/apostrophe script path'
+    } finally {
+        if (Test-Path -LiteralPath $argvProbeRoot) {
+            Remove-Item -LiteralPath $argvProbeRoot -Recurse -Force
+        }
     }
 }
 

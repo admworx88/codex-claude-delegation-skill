@@ -514,6 +514,43 @@ function New-OwnerSetupLaunchSpec(
     }
 }
 
+function Invoke-OwnerSetupLaunchSpec($LaunchSpec, [string]$Platform) {
+    switch ($Platform) {
+        'Windows' {
+            Start-Process -FilePath $LaunchSpec.FilePath -ArgumentList $LaunchSpec.ArgumentList `
+                -WorkingDirectory $LaunchSpec.WorkingDirectory | Out-Null
+            return
+        }
+        'MacOS' {
+            if ($PSVersionTable.PSVersion.Major -lt 7 -or
+                $null -eq [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
+                throw 'macOS owner setup requires PowerShell 7 ProcessStartInfo.ArgumentList support.'
+            }
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $LaunchSpec.FilePath
+            $startInfo.WorkingDirectory = $LaunchSpec.WorkingDirectory
+            $startInfo.UseShellExecute = $false
+            foreach ($argument in @($LaunchSpec.ArgumentList)) {
+                [void]$startInfo.ArgumentList.Add([string]$argument)
+            }
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            try {
+                if (-not $process.Start()) {
+                    throw "Failed to launch owner setup: $($LaunchSpec.FilePath)"
+                }
+                return $process
+            } catch {
+                $process.Dispose()
+                throw
+            }
+        }
+        default {
+            throw "Unsupported delegation platform: $Platform"
+        }
+    }
+}
+
 function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Installed) {
     $platform = Get-DelegationPlatform
     $launchSpec = New-OwnerSetupLaunchSpec -Worktree $Worktree -StateDirectory $StateDirectory `
@@ -529,8 +566,10 @@ function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Inst
             throw "Failed to secure owner setup script: $($launchSpec.ScriptPath)"
         }
     }
-    Start-Process -FilePath $launchSpec.FilePath -ArgumentList $launchSpec.ArgumentList `
-        -WorkingDirectory $launchSpec.WorkingDirectory | Out-Null
+    $launchProcess = Invoke-OwnerSetupLaunchSpec -LaunchSpec $launchSpec -Platform $platform
+    if ($null -ne $launchProcess) {
+        $launchProcess.Dispose()
+    }
 }
 
 function Set-OwnerWaitState([string]$LedgerPath, $Task, [string]$Reason) {
