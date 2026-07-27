@@ -20,10 +20,33 @@ function Resolve-AbsolutePath([string]$Path) {
     return (Get-Item -LiteralPath (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path -Force -ErrorAction Stop).FullName.TrimEnd('\', '/')
 }
 
+function Get-DelegationPlatform() {
+    if ($env:OS -eq 'Windows_NT' -or [Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        return 'Windows'
+    }
+    if ($PSVersionTable.PSVersion.Major -ge 7 -and
+        [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) {
+        return 'MacOS'
+    }
+    throw 'Claude delegation supports only Windows and macOS hosts.'
+}
+
+function Get-PathStringComparison([string]$Platform) {
+    switch ($Platform) {
+        'Windows' { return [System.StringComparison]::OrdinalIgnoreCase }
+        'MacOS' { return [System.StringComparison]::Ordinal }
+        default { throw "Unsupported delegation platform: $Platform" }
+    }
+}
+
+function Test-CanonicalPathEqual([string]$Left, [string]$Right, [string]$Platform) {
+    return [string]::Equals($Left, $Right, (Get-PathStringComparison -Platform $Platform))
+}
+
 function Get-WorktreeContext([string]$WorktreePath) {
     $resolved = Resolve-AbsolutePath $WorktreePath
     $topLevel = Resolve-AbsolutePath (Invoke-Git $resolved @('rev-parse', '--show-toplevel'))
-    if (-not $resolved.Equals($topLevel, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not (Test-CanonicalPathEqual -Left $resolved -Right $topLevel -Platform (Get-DelegationPlatform))) {
         throw "WorktreePath must be the linked worktree root: $topLevel"
     }
     $gitDir = Resolve-AbsolutePath (Invoke-Git $topLevel @('rev-parse', '--absolute-git-dir'))
@@ -44,7 +67,9 @@ function Get-WorktreeContext([string]$WorktreePath) {
 }
 
 function Assert-LinkedWorktree($Context) {
-    if ($Context.gitDir -eq $Context.commonDir) { throw 'Delegation requires a linked Git worktree.' }
+    if (Test-CanonicalPathEqual -Left $Context.gitDir -Right $Context.commonDir -Platform (Get-DelegationPlatform)) {
+        throw 'Delegation requires a linked Git worktree.'
+    }
     if ([string]::IsNullOrWhiteSpace($Context.branch)) { throw 'Detached HEAD is not allowed.' }
 }
 
@@ -100,12 +125,12 @@ function Read-AndAssertHandoffLedger([string]$LedgerPath, $Context, $Task) {
     }
     if ($ledger.version -isnot [int] -or $ledger.version -ne 1) { throw 'Unsupported handoff ledger version.' }
     if (-not (Test-NonEmptyString $ledger.repositoryId) -or
-        -not ([string]$ledger.repositoryId).Equals($Context.repositoryId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        -not (Test-CanonicalPathEqual -Left ([string]$ledger.repositoryId) -Right $Context.repositoryId -Platform (Get-DelegationPlatform))) {
         throw 'Handoff ledger repository identity does not match the linked worktree.'
     }
     if (-not (Test-NonEmptyString $ledger.worktreePath)) { throw 'Handoff ledger worktreePath is invalid.' }
     $ledgerWorktree = Resolve-AbsolutePath ([string]$ledger.worktreePath)
-    if (-not $ledgerWorktree.Equals($Context.worktreePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not (Test-CanonicalPathEqual -Left $ledgerWorktree -Right $Context.worktreePath -Platform (Get-DelegationPlatform))) {
         throw 'Handoff ledger worktree identity does not match the linked worktree.'
     }
     if (-not (Test-NonEmptyString $ledger.baseBranch) -or [string]$ledger.baseBranch -cne [string]$Task.baseBranch) {
@@ -457,7 +482,8 @@ function Get-WorktreeFingerprint([string]$Worktree) {
         $directory = $pending.Pop()
         foreach ($file in $directory.GetFiles()) {
             $relative = $file.FullName.Substring($rootPrefixLength).Replace('\', '/')
-            if ($relative -eq '.git' -or $relative.StartsWith('.codex/claude-handoff/', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ((Test-CanonicalPathEqual -Left $relative -Right '.git' -Platform (Get-DelegationPlatform)) -or
+                $relative.StartsWith('.codex/claude-handoff/', (Get-PathStringComparison (Get-DelegationPlatform)))) {
                 continue
             }
             if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
@@ -465,7 +491,10 @@ function Get-WorktreeFingerprint([string]$Worktree) {
         }
         foreach ($child in $directory.GetDirectories()) {
             $relative = $child.FullName.Substring($rootPrefixLength).Replace('\', '/')
-            if ($relative -eq '.git' -or $relative -eq '.codex/claude-handoff') { continue }
+            if ((Test-CanonicalPathEqual -Left $relative -Right '.git' -Platform (Get-DelegationPlatform)) -or
+                (Test-CanonicalPathEqual -Left $relative -Right '.codex/claude-handoff' -Platform (Get-DelegationPlatform))) {
+                continue
+            }
             if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
             $pending.Push($child)
         }
@@ -488,13 +517,19 @@ function ConvertTo-StableFingerprint([hashtable]$Fingerprint) {
 }
 
 function Get-SiblingWorktreeFingerprint($Context) {
-    $siblings = @{}
+    $comparison = Get-PathStringComparison -Platform (Get-DelegationPlatform)
+    $comparer = if ($comparison -eq [System.StringComparison]::OrdinalIgnoreCase) {
+        [System.StringComparer]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparer]::Ordinal
+    }
+    $siblings = [System.Collections.Hashtable]::new($comparer)
     $worktreeList = Invoke-Git $Context.worktreePath @('worktree', 'list', '--porcelain')
     foreach ($line in @($worktreeList -split "`r?`n")) {
         if (-not $line.StartsWith('worktree ')) { continue }
         $path = Resolve-AbsolutePath $line.Substring(9)
-        if ($path.Equals($Context.worktreePath, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-        $siblings[$path.ToLowerInvariant()] = ConvertTo-StableFingerprint (Get-WorktreeFingerprint -Worktree $path)
+        if (Test-CanonicalPathEqual -Left $path -Right $Context.worktreePath -Platform (Get-DelegationPlatform)) { continue }
+        $siblings[$path] = ConvertTo-StableFingerprint (Get-WorktreeFingerprint -Worktree $path)
     }
     return $siblings
 }
@@ -1032,8 +1067,8 @@ if (-not $LibraryMode) {
     Assert-LinkedWorktree -Context $context
     $resolvedTask = Resolve-AbsolutePath $TaskPacketPath
     $expectedStateDir = Join-Path $context.worktreePath '.codex/claude-handoff'
-    $statePrefix = $expectedStateDir.TrimEnd('\') + '\'
-    if (-not $resolvedTask.StartsWith($statePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $statePrefix = $expectedStateDir.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedTask.StartsWith($statePrefix, (Get-PathStringComparison (Get-DelegationPlatform)))) {
         throw 'Task packet must be stored inside .codex/claude-handoff/.'
     }
     $task = Read-TaskPacket -Path $resolvedTask

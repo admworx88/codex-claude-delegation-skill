@@ -43,6 +43,11 @@ foreach ($field in @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'un
 $Runner = Join-Path $RepoRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1'
 . $Runner -LibraryMode
 
+Assert-True ((Get-PathStringComparison -Platform 'Windows') -eq [System.StringComparison]::OrdinalIgnoreCase) 'Windows paths must use ordinal case-insensitive comparison'
+Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComparison]::Ordinal) 'macOS paths must use ordinal case-sensitive comparison'
+Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
+Assert-True (-not (Test-CanonicalPathEqual -Left '/Users/delegation/Task.json' -Right '/Users/delegation/task.json' -Platform 'MacOS')) 'macOS canonical paths must compare case-sensitively'
+
 $parsedExample = Read-TaskPacket -Path $TaskExample
 Assert-True ($parsedExample.id -eq 'task-001') 'task packet reader did not return the parsed packet'
 
