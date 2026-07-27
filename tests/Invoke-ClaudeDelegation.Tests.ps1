@@ -313,6 +313,12 @@ if "%CLAUDE_FAKE_MODE%"=="remote-change" (
 if "%CLAUDE_FAKE_MODE%"=="staged-change" (
   git -C "%CD%" add src\parser.ps1
 )
+if "%CLAUDE_FAKE_MODE%"=="skip-worktree-change" (
+  git -C "%CD%" update-index --skip-worktree src\parser.ps1
+)
+if "%CLAUDE_FAKE_MODE%"=="assume-unchanged-change" (
+  git -C "%CD%" update-index --assume-unchanged src\parser.ps1
+)
 if "%CLAUDE_FAKE_MODE%"=="ref-change" (
   git -C "%CD%" branch delegated-ref
   git -C "%CD%" tag delegated-tag
@@ -798,6 +804,8 @@ exit /b 0
 
     foreach ($gitMutation in @(
         [pscustomobject]@{ mode='staged-change'; violation='index-changed'; message='staged-only index mutation' },
+        [pscustomobject]@{ mode='skip-worktree-change'; violation='index-changed'; message='skip-worktree index flag mutation' },
+        [pscustomobject]@{ mode='assume-unchanged-change'; violation='index-changed'; message='assume-unchanged index flag mutation' },
         [pscustomobject]@{ mode='ref-change'; violation='refs-changed'; message='new branch and tag mutation' },
         [pscustomobject]@{ mode='config-change'; violation='config-changed'; message='local repository configuration mutation' },
         [pscustomobject]@{ mode='sibling-edit'; violation='sibling-worktree-changed'; message='sibling checkout file mutation' }
@@ -812,6 +820,14 @@ exit /b 0
         $mutationRecord = @($ledger.tasks)[-1]
         Assert-True ($mutationRecord.status -eq 'rejected') "$($gitMutation.message) was not rejected"
         Assert-True ($mutationRecord.repositoryViolations -contains $gitMutation.violation) "$($gitMutation.message) was not recorded"
+        if ($gitMutation.mode -eq 'skip-worktree-change') {
+            $indexFlag = Invoke-TestGit $linked @('ls-files', '-v', '--', 'src/parser.ps1')
+            Assert-True ($indexFlag -cmatch '^S ') 'runner automatically reverted the skip-worktree index flag'
+        }
+        if ($gitMutation.mode -eq 'assume-unchanged-change') {
+            $indexFlag = Invoke-TestGit $linked @('ls-files', '-v', '--', 'src/parser.ps1')
+            Assert-True ($indexFlag -cmatch '^s ') 'runner automatically reverted the assume-unchanged index flag'
+        }
     }
 
     $env:CLAUDE_FAKE_MODE = 'missing-session'

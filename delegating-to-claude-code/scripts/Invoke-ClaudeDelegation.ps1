@@ -509,12 +509,14 @@ function Get-GitMetadataSnapshot($Context) {
         Where-Object { $_ -ne '' } | Sort-Object) -join "`n"
     $remotes = @(Invoke-Git $Context.worktreePath @('remote', '-v') -split "`r?`n" |
         Where-Object { $_ -ne '' } | Sort-Object) -join "`n"
+    $indexPath = Resolve-AbsolutePath (Invoke-Git $Context.worktreePath @('rev-parse', '--git-path', 'index'))
     [pscustomobject]@{
         Head = Invoke-Git $Context.worktreePath @('rev-parse', 'HEAD')
         Branch = Invoke-Git $Context.worktreePath @('branch', '--show-current')
         Remotes = $remotes
         Index = @(Invoke-Git $Context.worktreePath @('ls-files', '--stage') -split "`r?`n" |
             Where-Object { $_ -ne '' } | Sort-Object) -join "`n"
+        IndexFile = Get-FileIdentity $indexPath
         Refs = $refs
         RepositoryConfig = Get-FileIdentity (Join-Path $Context.commonDir 'config')
         WorktreeConfig = Get-FileIdentity (Join-Path $Context.gitDir 'config.worktree')
@@ -966,7 +968,10 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         if ($endingBranchProbe.Success -and $startingBranch -ne $endingBranchProbe.Value) { $repositoryViolations += 'branch-changed' }
         if ($endingRemotesProbe.Success -and $startingRemotes -ne $endingRemotesProbe.Value) { $repositoryViolations += 'remotes-changed' }
         if ($endingMetadataProbe.Success) {
-            if ($startingMetadata.Index -cne $endingMetadataProbe.Value.Index) { $repositoryViolations += 'index-changed' }
+            if ($startingMetadata.Index -cne $endingMetadataProbe.Value.Index -or
+                $startingMetadata.IndexFile -cne $endingMetadataProbe.Value.IndexFile) {
+                $repositoryViolations += 'index-changed'
+            }
             if ($startingMetadata.Refs -cne $endingMetadataProbe.Value.Refs) { $repositoryViolations += 'refs-changed' }
             if ($startingMetadata.RepositoryConfig -cne $endingMetadataProbe.Value.RepositoryConfig -or
                 $startingMetadata.WorktreeConfig -cne $endingMetadataProbe.Value.WorktreeConfig) {
