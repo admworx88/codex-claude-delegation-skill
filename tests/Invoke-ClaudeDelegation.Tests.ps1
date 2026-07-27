@@ -46,6 +46,18 @@ $Runner = Join-Path $RepoRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDe
 $parsedExample = Read-TaskPacket -Path $TaskExample
 Assert-True ($parsedExample.id -eq 'task-001') 'task packet reader did not return the parsed packet'
 
+$missingContextPacket = $task | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$missingContextPacket.PSObject.Properties.Remove('context')
+$missingContextPath = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-delegation-missing-context-" + [guid]::NewGuid() + '.json')
+try {
+    $missingContextPacket | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $missingContextPath -Encoding UTF8
+    $missingContextRejected = $false
+    try { Read-TaskPacket -Path $missingContextPath | Out-Null } catch { $missingContextRejected = $true }
+    Assert-True $missingContextRejected 'task packet reader must require context'
+} finally {
+    if (Test-Path -LiteralPath $missingContextPath) { Remove-Item -LiteralPath $missingContextPath -Force }
+}
+
 $direct = [pscustomobject]@{
     id='task-direct'; goal='Fix one parser'; mode='direct'
     allowedPaths=@('src/parser.ps1'); forbiddenPaths=@('.git/**')
@@ -56,10 +68,42 @@ $direct = [pscustomobject]@{
 $directInvocation = New-ClaudeInvocation -Task $direct -SessionId 'session-123' -SupportsForwarding $true
 Assert-True ($directInvocation.arguments -contains '--resume') 'direct mode must resume primary session'
 Assert-True (-not $directInvocation.environment.ContainsKey('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS')) 'direct mode enabled teams'
-Assert-True ($directInvocation.arguments -contains 'Bash(git *)') 'git deny rule missing'
-Assert-True ($directInvocation.arguments -contains 'Bash(git.exe *)') 'git.exe deny rule missing'
+$expectedGitDenyPatterns = @(
+    'Bash(git *)', 'Bash(git.exe *)',
+    'Bash(* git *)', 'Bash(* git.exe *)',
+    'Bash(*\git *)', 'Bash(*\git.exe *)',
+    'Bash(*/git *)', 'Bash(*/git.exe *)'
+)
+foreach ($denyPattern in $expectedGitDenyPatterns) {
+    Assert-True ($directInvocation.arguments -contains $denyPattern) "git wrapper deny rule missing: $denyPattern"
+}
 Assert-True ($directInvocation.arguments -contains '--output-format') 'output-format flag missing'
 Assert-True ($directInvocation.arguments[[Array]::IndexOf([object[]]$directInvocation.arguments, '--output-format') + 1] -eq 'json') 'direct mode output must remain JSON'
+
+$zeroBudget = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$zeroBudget.limits.maxBudgetUsd = 0
+$zeroBudgetInvocation = New-ClaudeInvocation -Task $zeroBudget -SessionId 'session-123' -SupportsForwarding $true
+$zeroBudgetIndex = [Array]::IndexOf([object[]]$zeroBudgetInvocation.arguments, '--max-budget-usd')
+Assert-True ($zeroBudgetIndex -ge 0) 'explicit zero budget must not be omitted'
+Assert-True ($zeroBudgetInvocation.arguments[$zeroBudgetIndex + 1] -eq '0') 'explicit zero budget was not preserved'
+
+foreach ($invalidLimit in @(
+    [pscustomobject]@{ property = 'maxTurns'; value = 0; message = 'zero maxTurns must be rejected' },
+    [pscustomobject]@{ property = 'maxTurns'; value = 1.5; message = 'fractional maxTurns must be rejected' },
+    [pscustomobject]@{ property = 'timeoutSeconds'; value = 0; message = 'zero timeoutSeconds must be rejected' },
+    [pscustomobject]@{ property = 'maxBudgetUsd'; value = -0.01; message = 'negative maxBudgetUsd must be rejected' }
+)) {
+    $invalidTask = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $invalidTask.limits.($invalidLimit.property) = $invalidLimit.value
+    $invalidRejected = $false
+    try { Assert-DelegationPolicy -Task $invalidTask } catch { $invalidRejected = $true }
+    Assert-True $invalidRejected $invalidLimit.message
+}
+$missingTurns = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$missingTurns.limits.PSObject.Properties.Remove('maxTurns')
+$missingTurnsRejected = $false
+try { Assert-DelegationPolicy -Task $missingTurns } catch { $missingTurnsRejected = $true }
+Assert-True $missingTurnsRejected 'missing maxTurns must be rejected'
 
 $subagents = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
 $subagents.mode = 'subagents'
@@ -86,6 +130,7 @@ Assert-True (-not ($teamInvocation.arguments -contains '--resume')) 'team mode m
 Assert-True (Test-ForwardSubagentSupport -VersionText '2.1.211 (Claude Code)') 'supported forwarding version rejected'
 Assert-True (-not (Test-ForwardSubagentSupport -VersionText '2.1.210 (Claude Code)')) 'unsupported forwarding version accepted'
 Assert-True (-not (Test-ForwardSubagentSupport -VersionText 'invalid')) 'invalid forwarding version accepted'
+Assert-True (-not (Test-ForwardSubagentSupport -VersionText 'Claude Code 2.1.211')) 'embedded forwarding version accepted'
 
 $overlap = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
 $overlap.parallelWorkstreams = @(
@@ -95,6 +140,22 @@ $overlap.parallelWorkstreams = @(
 $rejected = $false
 try { Assert-DelegationPolicy -Task $overlap } catch { $rejected = $true }
 Assert-True $rejected 'overlapping team ownership must be rejected'
+
+$mixedSeparatorOverlap = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$mixedSeparatorOverlap.parallelWorkstreams = @(
+    [pscustomobject]@{ name='one'; ownedPaths=@('src\api\**') },
+    [pscustomobject]@{ name='two'; ownedPaths=@('src/api/**') }
+)
+$rejected = $false
+try { Assert-DelegationPolicy -Task $mixedSeparatorOverlap } catch { $rejected = $true }
+Assert-True $rejected 'mixed path separators must still overlap'
+
+$boundaryDistinct = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$boundaryDistinct.parallelWorkstreams = @(
+    [pscustomobject]@{ name='api'; ownedPaths=@('src/api/**') },
+    [pscustomobject]@{ name='api-client'; ownedPaths=@('src/api-client/**') }
+)
+Assert-DelegationPolicy -Task $boundaryDistinct
 
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-delegation-" + [guid]::NewGuid())
 $mainRepo = Join-Path $fixtureRoot 'main'

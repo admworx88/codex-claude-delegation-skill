@@ -71,7 +71,7 @@ function Initialize-HandoffState($Context) {
 function Read-TaskPacket([string]$Path) {
     $resolved = Resolve-AbsolutePath $Path
     $task = Get-Content -Raw -LiteralPath $resolved | ConvertFrom-Json
-    foreach ($name in @('id', 'goal', 'mode', 'allowedPaths', 'forbiddenPaths', 'forbiddenActions', 'acceptanceCriteria', 'requiredVerification', 'limits')) {
+    foreach ($name in @('id', 'goal', 'mode', 'allowedPaths', 'forbiddenPaths', 'forbiddenActions', 'context', 'acceptanceCriteria', 'requiredVerification', 'limits')) {
         if ($null -eq $task.$name) { throw "Task packet missing required field: $name" }
     }
     Assert-DelegationPolicy -Task $task
@@ -79,14 +79,49 @@ function Read-TaskPacket([string]$Path) {
 }
 
 function Test-PathPatternOverlap([string]$Left, [string]$Right) {
-    $a = $Left.TrimEnd('*', '/', '\')
-    $b = $Right.TrimEnd('*', '/', '\')
-    return $a.StartsWith($b, [System.StringComparison]::OrdinalIgnoreCase) -or
-           $b.StartsWith($a, [System.StringComparison]::OrdinalIgnoreCase)
+    $a = (($Left -replace '\\', '/') -replace '/+', '/').TrimEnd([char[]]@('*', '/'))
+    $b = (($Right -replace '\\', '/') -replace '/+', '/').TrimEnd([char[]]@('*', '/'))
+    if ($a.Length -eq 0 -or $b.Length -eq 0) { return $true }
+    return $a.Equals($b, [System.StringComparison]::OrdinalIgnoreCase) -or
+           $a.StartsWith($b + '/', [System.StringComparison]::OrdinalIgnoreCase) -or
+           $b.StartsWith($a + '/', [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-PositiveInteger($Value) {
+    $isInteger = $Value -is [byte] -or $Value -is [sbyte] -or
+                 $Value -is [int16] -or $Value -is [uint16] -or
+                 $Value -is [int32] -or $Value -is [uint32] -or
+                 $Value -is [int64] -or $Value -is [uint64]
+    return $isInteger -and $Value -gt 0
+}
+
+function Test-NonNegativeNumber($Value) {
+    if ($null -eq $Value -or $Value -is [string] -or $Value -is [bool]) { return $false }
+    try { return [decimal]$Value -ge 0 } catch { return $false }
+}
+
+function Test-PositiveNumber($Value) {
+    if (-not (Test-NonNegativeNumber $Value)) { return $false }
+    return [decimal]$Value -gt 0
+}
+
+function Assert-TaskLimits($Limits) {
+    if ($null -eq $Limits) { throw 'Task packet limits are required.' }
+    $limitNames = $Limits.PSObject.Properties.Name
+    if ($limitNames -notcontains 'maxTurns' -or -not (Test-PositiveInteger $Limits.maxTurns)) {
+        throw 'limits.maxTurns must be a positive integer.'
+    }
+    if ($limitNames -notcontains 'timeoutSeconds' -or -not (Test-PositiveNumber $Limits.timeoutSeconds)) {
+        throw 'limits.timeoutSeconds must be positive.'
+    }
+    if ($limitNames -contains 'maxBudgetUsd' -and -not (Test-NonNegativeNumber $Limits.maxBudgetUsd)) {
+        throw 'limits.maxBudgetUsd must be non-negative when provided.'
+    }
 }
 
 function Assert-DelegationPolicy($Task) {
     if (@('direct', 'subagents', 'agent-team') -notcontains $Task.mode) { throw "Unsupported mode: $($Task.mode)" }
+    Assert-TaskLimits $Task.limits
     if ($Task.mode -ne 'agent-team') { return }
 
     $workstreams = @($Task.parallelWorkstreams)
@@ -109,7 +144,7 @@ function Assert-DelegationPolicy($Task) {
 }
 
 function Test-ForwardSubagentSupport([string]$VersionText) {
-    $match = [regex]::Match($VersionText, '(\d+)\.(\d+)\.(\d+)')
+    $match = [regex]::Match($VersionText, '^\s*(\d+)\.(\d+)\.(\d+)(?:\s|$)')
     if (-not $match.Success) { return $false }
     $version = New-Object System.Version -ArgumentList @(
         [int]$match.Groups[1].Value,
@@ -133,12 +168,19 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
     $args = @('-p', $prompt, '--dangerously-skip-permissions', '--output-format', 'json',
               '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
     $args += '--disallowedTools'
-    $args += @('Bash(git *)', 'Bash(git.exe *)')
+    $args += @(
+        'Bash(git *)', 'Bash(git.exe *)',
+        'Bash(* git *)', 'Bash(* git.exe *)',
+        'Bash(*\git *)', 'Bash(*\git.exe *)',
+        'Bash(*/git *)', 'Bash(*/git.exe *)'
+    )
 
     $environment = @{}
     $fresh = $Task.mode -eq 'agent-team'
     if (-not $fresh -and $SessionId) { $args += @('--resume', $SessionId) }
-    if ($Task.limits.maxBudgetUsd) { $args += @('--max-budget-usd', [string]$Task.limits.maxBudgetUsd) }
+    if ($Task.limits.PSObject.Properties.Name -contains 'maxBudgetUsd') {
+        $args += @('--max-budget-usd', [string]$Task.limits.maxBudgetUsd)
+    }
     if ($Task.mode -ne 'direct' -and $SupportsForwarding) {
         $outputIndex = [Array]::IndexOf([object[]]$args, '--output-format')
         $args[$outputIndex + 1] = 'stream-json'
