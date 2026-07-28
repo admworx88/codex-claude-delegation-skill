@@ -120,14 +120,16 @@ if (Test-Path -LiteralPath $destination) {
 Copy-Item -Recurse -LiteralPath $source -Destination $destination
 ```
 
-Verify both the skill instructions and guarded runner:
+Verify the instructions, guarded runner, task-packet example, and result schema:
 
 ```powershell
 Test-Path (Join-Path $destination 'SKILL.md')
 Test-Path (Join-Path $destination 'scripts\Invoke-ClaudeDelegation.ps1')
+Test-Path (Join-Path $destination 'references\task-packet.example.json')
+Test-Path (Join-Path $destination 'references\result-schema.json')
 ```
 
-Success prints `True` twice.
+Success prints `True` four times.
 
 ### 6. Restart Codex
 
@@ -243,14 +245,19 @@ else
 fi
 ```
 
-Verify both required files:
+Verify the instructions, guarded runner, task-packet example, and result schema:
 
 ```bash
 test -f "$destination/SKILL.md" && echo "SKILL.md found"
 test -f "$destination/scripts/Invoke-ClaudeDelegation.ps1" && echo "Runner found"
+test -f "$destination/references/task-packet.example.json" \
+  && echo "Task-packet example found"
+test -f "$destination/references/result-schema.json" \
+  && echo "Result schema found"
 ```
 
-Success prints both `SKILL.md found` and `Runner found`.
+Success prints `SKILL.md found`, `Runner found`, `Task-packet example found`,
+and `Result schema found`.
 
 ### 8. Restart Codex
 
@@ -391,53 +398,212 @@ copy. Finish any active delegation first, then close Codex.
 Run in PowerShell:
 
 ```powershell
-$repo = Join-Path $HOME 'codex-claude-delegation-skill'
-$source = Join-Path $repo 'delegating-to-claude-code'
-$destination = Join-Path $HOME '.agents\skills\delegating-to-claude-code'
-$backupRoot = Join-Path $HOME '.agents\skill-backups'
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backup = Join-Path $backupRoot "delegating-to-claude-code-$stamp"
+& {
+    $ErrorActionPreference = 'Stop'
 
-Set-Location $repo
-git pull --ff-only
-if (-not (Test-Path -LiteralPath $destination)) {
-    throw "Installed skill not found at $destination"
+    function Test-RequiredSkillFiles([string]$Root) {
+        $required = @(
+            'SKILL.md'
+            'scripts\Invoke-ClaudeDelegation.ps1'
+            'references\task-packet.example.json'
+            'references\result-schema.json'
+        )
+        return -not ($required | Where-Object {
+            -not (Test-Path -LiteralPath (Join-Path $Root $_) -PathType Leaf)
+        })
+    }
+
+    $repo = Join-Path $HOME 'codex-claude-delegation-skill'
+    $source = Join-Path $repo 'delegating-to-claude-code'
+    $skillsRoot = Join-Path $HOME '.agents\skills'
+    $destination = Join-Path $skillsRoot 'delegating-to-claude-code'
+    $backupRoot = Join-Path $HOME '.agents\skill-backups'
+    $stamp = (Get-Date -Format 'yyyyMMdd-HHmmssfff') + '-' +
+        [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $stage = Join-Path $skillsRoot ".delegating-to-claude-code-stage-$stamp"
+    $backup = Join-Path $backupRoot "delegating-to-claude-code-$stamp"
+    $failed = Join-Path $skillsRoot ".delegating-to-claude-code-failed-$stamp"
+
+    if (-not (Test-Path -LiteralPath $repo -PathType Container)) {
+        throw "Repository not found at $repo"
+    }
+    if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+        throw "Installed skill not found at $destination"
+    }
+    if (-not (Test-RequiredSkillFiles $destination)) {
+        throw "Installed skill is incomplete at $destination"
+    }
+
+    try {
+        Set-Location -LiteralPath $repo -ErrorAction Stop
+    }
+    catch {
+        throw "Cannot enter repository: $repo"
+    }
+    git rev-parse --is-inside-work-tree
+    if ($LASTEXITCODE -ne 0) {
+        throw "Not a Git worktree: $repo"
+    }
+    git pull --ff-only
+    if ($LASTEXITCODE -ne 0) {
+        throw 'git pull --ff-only failed; the installed skill was not changed.'
+    }
+
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) {
+        throw "Updated skill source not found at $source"
+    }
+    if (-not (Test-RequiredSkillFiles $source)) {
+        throw "Updated skill source is incomplete at $source"
+    }
+    if ((Test-Path -LiteralPath $stage) -or
+        (Test-Path -LiteralPath $backup) -or
+        (Test-Path -LiteralPath $failed)) {
+        throw 'Unique update staging or backup path already exists.'
+    }
+
+    New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+    Copy-Item -Recurse -LiteralPath $source -Destination $stage
+    if (-not (Test-RequiredSkillFiles $stage)) {
+        throw "Staged skill verification failed. Live install is unchanged. Inspect $stage"
+    }
+
+    Move-Item -LiteralPath $destination -Destination $backup
+    try {
+        Move-Item -LiteralPath $stage -Destination $destination
+        if (-not (Test-RequiredSkillFiles $destination)) {
+            throw 'Final installed-skill verification failed.'
+        }
+    }
+    catch {
+        $updateError = $_.Exception.Message
+        $preservedCandidate = $stage
+        try {
+            if (Test-Path -LiteralPath $destination) {
+                Move-Item -LiteralPath $destination -Destination $failed
+                $preservedCandidate = $failed
+            }
+            Move-Item -LiteralPath $backup -Destination $destination
+        }
+        catch {
+            throw "Update failed and automatic restore failed. Original backup: $backup. Staging or failed copy: $stage $failed"
+        }
+        throw "Update failed; the original skill was restored. Cause: $updateError. Preserved candidate: $preservedCandidate"
+    }
+
+    Write-Host "Skill updated. Previous installation: $backup"
 }
-New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
-Move-Item -LiteralPath $destination -Destination $backup
-Copy-Item -Recurse -LiteralPath $source -Destination $destination
-Test-Path (Join-Path $destination 'SKILL.md')
 ```
 
-Success prints `True`. Your previous installation is preserved at the path in
-`$backup`. Restart Codex after the update.
+Success prints `Skill updated` and the exact backup path. A pull, copy, or
+staged-file verification failure leaves the live installation unchanged. A
+final replacement failure restores the timestamped backup and reports any
+preserved failed candidate. Restart Codex only after the success message.
 
 ### macOS update
 
 Run in Terminal:
 
 ```bash
-repo="$HOME/codex-claude-delegation-skill"
-source_dir="$repo/delegating-to-claude-code"
-destination="$HOME/.agents/skills/delegating-to-claude-code"
-backup_root="$HOME/.agents/skill-backups"
-stamp="$(date +%Y%m%d-%H%M%S)"
-backup="$backup_root/delegating-to-claude-code-$stamp"
+(
+  set -euo pipefail
 
-cd "$repo"
-git pull --ff-only
-if [ ! -d "$destination" ]; then
-  echo "Installed skill not found at $destination"
-else
+  required_files=(
+    "SKILL.md"
+    "scripts/Invoke-ClaudeDelegation.ps1"
+    "references/task-packet.example.json"
+    "references/result-schema.json"
+  )
+  verify_skill() {
+    local root="$1"
+    local relative
+    for relative in "${required_files[@]}"; do
+      [ -f "$root/$relative" ] || return 1
+    done
+  }
+
+  repo="$HOME/codex-claude-delegation-skill"
+  source_dir="$repo/delegating-to-claude-code"
+  skills_root="$HOME/.agents/skills"
+  destination="$skills_root/delegating-to-claude-code"
+  backup_root="$HOME/.agents/skill-backups"
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  stage="$skills_root/.delegating-to-claude-code-stage-$stamp"
+  backup="$backup_root/delegating-to-claude-code-$stamp"
+  failed="$skills_root/.delegating-to-claude-code-failed-$stamp"
+
+  [ -d "$repo" ] || {
+    echo "Repository not found at $repo" >&2
+    exit 1
+  }
+  [ -d "$destination" ] || {
+    echo "Installed skill not found at $destination" >&2
+    exit 1
+  }
+  verify_skill "$destination" || {
+    echo "Installed skill is incomplete at $destination" >&2
+    exit 1
+  }
+
+  cd "$repo" || {
+    echo "Cannot enter repository: $repo" >&2
+    exit 1
+  }
+  git rev-parse --is-inside-work-tree >/dev/null || {
+    echo "Not a Git worktree: $repo" >&2
+    exit 1
+  }
+  git pull --ff-only || {
+    echo "git pull --ff-only failed; the installed skill was not changed." >&2
+    exit 1
+  }
+
+  [ -d "$source_dir" ] || {
+    echo "Updated skill source not found at $source_dir" >&2
+    exit 1
+  }
+  verify_skill "$source_dir" || {
+    echo "Updated skill source is incomplete at $source_dir" >&2
+    exit 1
+  }
+  [ ! -e "$stage" ] && [ ! -e "$backup" ] && [ ! -e "$failed" ] || {
+    echo "Unique update staging or backup path already exists." >&2
+    exit 1
+  }
+
   mkdir -p "$backup_root"
+  cp -R "$source_dir" "$stage"
+  verify_skill "$stage" || {
+    echo "Staged skill verification failed. Live install is unchanged. Inspect $stage" >&2
+    exit 1
+  }
+
   mv "$destination" "$backup"
-  cp -R "$source_dir" "$destination"
-  test -f "$destination/SKILL.md" && echo "Skill updated"
-fi
+  if ! mv "$stage" "$destination" || ! verify_skill "$destination"; then
+    update_error="final move or installed-skill verification failed"
+    preserved_candidate="$stage"
+    if [ -e "$destination" ]; then
+      mv "$destination" "$failed" || {
+        echo "Update and automatic restore failed. Original backup: $backup" >&2
+        exit 1
+      }
+      preserved_candidate="$failed"
+    fi
+    mv "$backup" "$destination" || {
+      echo "Update and automatic restore failed. Original backup: $backup" >&2
+      exit 1
+    }
+    echo "Update failed; the original skill was restored. Cause: $update_error. Preserved candidate: $preserved_candidate" >&2
+    exit 1
+  fi
+
+  echo "Skill updated. Previous installation: $backup"
+)
 ```
 
-Success prints `Skill updated`. Your previous installation is preserved at
-the path in `$backup`. Restart Codex after the update.
+Success prints `Skill updated` and the exact backup path. A pull, copy, or
+staged-file verification failure leaves the live installation unchanged. A
+final replacement failure restores the timestamped backup and reports any
+preserved failed candidate. Restart Codex only after the success message.
 
 ## Uninstall the skill
 
