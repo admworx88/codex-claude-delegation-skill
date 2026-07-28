@@ -33,6 +33,17 @@ function Resolve-LinkTargetPath([string]$Candidate, [string]$Target) {
     return [System.IO.Path]::GetFullPath((Join-Path $parent $Target))
 }
 
+function Remove-TrailingPathSeparatorsExceptRoot([string]$Path) {
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    if ([string]::IsNullOrEmpty($root)) { throw "Path must be absolute: $Path" }
+    $trimmedPath = $Path.TrimEnd('\', '/')
+    $trimmedRoot = $root.TrimEnd('\', '/')
+    if ([string]::Equals($trimmedPath, $trimmedRoot, [System.StringComparison]::Ordinal)) {
+        return $Path
+    }
+    return $trimmedPath
+}
+
 function Resolve-CanonicalExistingPathInternal([string]$Path, [int]$LinkDepth) {
     if ($LinkDepth -gt 64) { throw "Path contains too many link indirections: $Path" }
 
@@ -65,9 +76,7 @@ function Resolve-CanonicalExistingPathInternal([string]$Path, [int]$LinkDepth) {
         $targetPath = Resolve-LinkTargetPath -Candidate $candidate -Target $target
         $current = Resolve-CanonicalExistingPathInternal -Path $targetPath -LinkDepth ($LinkDepth + 1)
     }
-    $currentRoot = [System.IO.Path]::GetPathRoot($current)
-    if ($current.Length -eq $currentRoot.Length) { return $currentRoot }
-    return $current.TrimEnd('\', '/')
+    return Remove-TrailingPathSeparatorsExceptRoot $current
 }
 
 function Resolve-AbsolutePath([string]$Path) {
@@ -204,7 +213,7 @@ function Read-AndAssertHandoffLedger([string]$LedgerPath, $Context, $Task) {
         @($names | Where-Object { $required -notcontains $_ }).Count -gt 0) {
         throw 'Handoff ledger has an invalid shape.'
     }
-    if ($ledger.version -isnot [int] -or $ledger.version -ne 1) { throw 'Unsupported handoff ledger version.' }
+    if (-not (Test-SupportedLedgerVersion $ledger.version)) { throw 'Unsupported handoff ledger version.' }
     if (-not (Test-NonEmptyString $ledger.repositoryId)) {
         throw 'Handoff ledger repository identity does not match the linked worktree.'
     }
@@ -288,6 +297,10 @@ function Test-PositiveInteger($Value) {
                  $Value -is [int32] -or $Value -is [uint32] -or
                  $Value -is [int64] -or $Value -is [uint64]
     return $isInteger -and $Value -gt 0
+}
+
+function Test-SupportedLedgerVersion($Value) {
+    return (Test-PositiveInteger $Value) -and [uint64]$Value -eq 1
 }
 
 function Test-NonNegativeNumber($Value) {
@@ -569,11 +582,14 @@ function New-OwnerSetupLaunchSpec(
             }
         }
         'MacOS' {
-            $scriptPath = Join-Path $StateDirectory 'claude-owner-setup.command'
+            $scriptPath = Join-Path $StateDirectory (
+                'claude-owner-setup-' + [guid]::NewGuid().ToString('N') + '.command'
+            )
             return [pscustomobject]@{
                 FilePath = 'open'
                 ArgumentList = [object[]]@('-a', 'Terminal', $scriptPath)
                 WorkingDirectory = $Worktree
+                StateDirectory = $StateDirectory
                 ScriptPath = $scriptPath
                 ScriptContent = New-MacOwnerSetupScriptContent -Worktree $Worktree -Installed $Installed
             }
@@ -602,6 +618,10 @@ function Invoke-OwnerSetupLaunchSpec($LaunchSpec, [string]$Platform) {
             $startInfo.UseShellExecute = $false
             foreach ($argument in @($LaunchSpec.ArgumentList)) {
                 [void]$startInfo.ArgumentList.Add([string]$argument)
+            }
+            if ($null -ne $LaunchSpec.PSObject.Properties['StateDirectory']) {
+                Assert-OwnerSetupScriptLeafIdentity -ScriptPath $LaunchSpec.ScriptPath `
+                    -StateDirectory $LaunchSpec.StateDirectory -Platform $Platform | Out-Null
             }
             $process = [System.Diagnostics.Process]::new()
             $process.StartInfo = $startInfo
@@ -650,6 +670,34 @@ function Assert-SafeOwnerSetupScriptPath(
     return Join-Path $stateIdentity ([System.IO.Path]::GetFileName($fullScriptPath))
 }
 
+function Assert-OwnerSetupScriptLeafIdentity(
+    [string]$ScriptPath,
+    [string]$StateDirectory,
+    [string]$Platform
+) {
+    $expectedPath = Assert-SafeOwnerSetupScriptPath -ScriptPath $ScriptPath `
+        -StateDirectory $StateDirectory -Platform $Platform
+    $leaf = Get-Item -LiteralPath $expectedPath -Force -ErrorAction Stop
+    $linkTypeProperty = $leaf.PSObject.Properties['LinkType']
+    $linkType = if ($null -eq $linkTypeProperty) { '' } else { [string]$linkTypeProperty.Value }
+    if (($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $linkType -in @('SymbolicLink', 'Junction')) {
+        throw 'Owner setup script path must not be a link or reparse point.'
+    }
+    $resolvedPath = Resolve-AbsolutePath $expectedPath
+    if (-not (Test-CanonicalPathEqual -Left $resolvedPath -Right $expectedPath -Platform $Platform)) {
+        throw 'Owner setup script escaped the handoff state directory.'
+    }
+    return $resolvedPath
+}
+
+function Set-OwnerSetupScriptMode([string]$ScriptPath) {
+    & chmod 700 $ScriptPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to secure owner setup script: $ScriptPath"
+    }
+}
+
 function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Installed) {
     $platform = Get-DelegationPlatform
     $launchSpec = New-OwnerSetupLaunchSpec -Worktree $Worktree -StateDirectory $StateDirectory `
@@ -657,7 +705,6 @@ function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Inst
     if ($platform -eq 'MacOS') {
         $safeScriptPath = Assert-SafeOwnerSetupScriptPath -ScriptPath $launchSpec.ScriptPath `
             -StateDirectory $StateDirectory -Platform $platform
-        [System.IO.File]::Delete($safeScriptPath)
         $scriptStream = [System.IO.FileStream]::new(
             $safeScriptPath,
             [System.IO.FileMode]::CreateNew,
@@ -678,14 +725,11 @@ function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Inst
         } finally {
             $scriptStream.Dispose()
         }
-        $securedScriptPath = Resolve-AbsolutePath $safeScriptPath
-        if (-not (Test-CanonicalPathEqual -Left $securedScriptPath -Right $safeScriptPath -Platform $platform)) {
-            throw 'Owner setup script escaped the handoff state directory.'
-        }
-        & chmod 700 $securedScriptPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to secure owner setup script: $safeScriptPath"
-        }
+        $securedScriptPath = Assert-OwnerSetupScriptLeafIdentity -ScriptPath $safeScriptPath `
+            -StateDirectory $StateDirectory -Platform $platform
+        Set-OwnerSetupScriptMode -ScriptPath $securedScriptPath
+        $securedScriptPath = Assert-OwnerSetupScriptLeafIdentity -ScriptPath $securedScriptPath `
+            -StateDirectory $StateDirectory -Platform $platform
         $launchSpec.ScriptPath = $securedScriptPath
         $launchSpec.ArgumentList = [object[]]@('-a', 'Terminal', $securedScriptPath)
     }

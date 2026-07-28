@@ -43,6 +43,19 @@ foreach ($field in @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'un
 $Runner = Join-Path $RepoRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1'
 . $Runner -LibraryMode
 
+Assert-True (Test-SupportedLedgerVersion ([int]1)) 'Int32 ledger version 1 must be accepted'
+Assert-True (Test-SupportedLedgerVersion ([long]1)) 'Int64 ledger version 1 must be accepted'
+Assert-True (-not (Test-SupportedLedgerVersion '1')) 'string ledger version 1 must be rejected'
+Assert-True (-not (Test-SupportedLedgerVersion $true)) 'boolean ledger version true must be rejected'
+Assert-True (-not (Test-SupportedLedgerVersion ([double]1.0))) 'fraction-capable ledger version 1.0 must be rejected'
+Assert-True (-not (Test-SupportedLedgerVersion ([long]2))) 'unknown integral ledger versions must be rejected'
+Assert-True (
+    (Remove-TrailingPathSeparatorsExceptRoot 'D:\') -ceq 'D:\'
+) 'drive roots must preserve their trailing root separator'
+Assert-True (
+    (Remove-TrailingPathSeparatorsExceptRoot '\\server\share\') -ceq '\\server\share\'
+) 'UNC roots must preserve their trailing root separator'
+
 Assert-True ((Get-PathStringComparison -Platform 'Windows') -eq [System.StringComparison]::OrdinalIgnoreCase) 'Windows paths must use ordinal case-insensitive comparison'
 Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComparison]::Ordinal) 'macOS paths must use ordinal case-sensitive comparison'
 Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
@@ -74,17 +87,6 @@ try {
         (Resolve-AbsolutePath $escapedTaskAlias) -eq $resolvedPhysicalFile
     ) 'a task packet under a linked parent must resolve outside the state directory so containment checks reject escapes'
 
-    $fixtureRootPath = [System.IO.Path]::GetPathRoot($canonicalPathFixture)
-    $crossRootTarget = Get-PSDrive -PSProvider FileSystem |
-        Where-Object { $_.Root -and $_.Root -ne $fixtureRootPath -and (Test-Path -LiteralPath $_.Root) } |
-        Select-Object -First 1
-    if ($null -ne $crossRootTarget) {
-        $crossRootAlias = Join-Path $canonicalPathFixture 'cross-root-alias'
-        New-Item -ItemType Junction -Path $crossRootAlias -Target $crossRootTarget.Root | Out-Null
-        Assert-True (
-            (Resolve-AbsolutePath $crossRootAlias) -eq $crossRootTarget.Root
-        ) 'a link targeting another filesystem root must preserve the target root separator'
-    }
 } finally {
     $canonicalPathFixtureFull = [System.IO.Path]::GetFullPath($canonicalPathFixture)
     $temporaryRoot = [System.IO.Path]::GetFullPath(
@@ -208,7 +210,11 @@ if not "%~3"=="" echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
 
     Show-OwnerSetup -Worktree $macOwnerSetupRoot -StateDirectory $macOwnerSetupState -Installed $true
 
-    $writtenMacSetupPath = Join-Path $macOwnerSetupState 'claude-owner-setup.command'
+    $writtenMacSetupPath = [string]$global:capturedMacOwnerSetup.Launch.ScriptPath
+    Assert-True (
+        (Split-Path -Leaf $writtenMacSetupPath) -match
+        '^claude-owner-setup-[0-9a-f]{32}\.command$'
+    ) 'macOS owner setup must use an unpredictable generated script leaf'
     Assert-True (Test-Path -LiteralPath $writtenMacSetupPath) 'macOS owner setup must write the generated command script before launch'
     $writtenMacSetupBytes = [System.IO.File]::ReadAllBytes($writtenMacSetupPath)
     $hasUtf8Bom = $writtenMacSetupBytes.Length -ge 3 -and $writtenMacSetupBytes[0] -eq 0xEF -and `

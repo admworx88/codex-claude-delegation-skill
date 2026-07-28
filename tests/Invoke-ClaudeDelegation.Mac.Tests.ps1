@@ -341,25 +341,33 @@ done
         "outside-owner-script-unchanged`n",
         [System.Text.UTF8Encoding]::new($false)
     )
-    $ownerScriptLink = Join-Path $stateDirectory 'claude-owner-setup.command'
-    New-Item -ItemType SymbolicLink -Path $ownerScriptLink `
-        -Target $outsideOwnerScriptTarget | Out-Null
-    $ownerScriptLinkRejected = $false
-    try {
-        Show-OwnerSetup -Worktree $linkedWorktree `
-            -StateDirectory $stateDirectory -Installed $true
-    } catch {
-        $ownerScriptLinkRejected = $true
+    $originalSetOwnerSetupScriptMode = ${function:Set-OwnerSetupScriptMode}
+    function Set-OwnerSetupScriptMode([string]$ScriptPath) {
+        [System.IO.File]::Delete($ScriptPath)
+        New-Item -ItemType SymbolicLink -Path $ScriptPath `
+            -Target $outsideOwnerScriptTarget | Out-Null
     }
-    Assert-True $ownerScriptLinkRejected 'owner setup followed a pre-existing script symlink'
+    $ownerScriptSwapRejected = $false
+    try {
+        try {
+            Show-OwnerSetup -Worktree $linkedWorktree `
+                -StateDirectory $stateDirectory -Installed $true
+        } catch {
+            $ownerScriptSwapRejected = $true
+        }
+    } finally {
+        Set-Item Function:\Set-OwnerSetupScriptMode -Value $originalSetOwnerSetupScriptMode
+    }
+    Assert-True $ownerScriptSwapRejected 'owner setup launched a script leaf swapped after creation'
     Assert-True (
         (Get-Content -Raw -LiteralPath $outsideOwnerScriptTarget) -ceq
         "outside-owner-script-unchanged`n"
-    ) 'owner setup overwrote the external target of a pre-existing script symlink'
+    ) 'owner setup race handling mutated the external symlink target'
     Assert-True (
         -not (Test-Path -LiteralPath $env:DELEGATION_OPEN_CAPTURE)
-    ) 'rejected owner-script symlink still launched Terminal'
-    Remove-Item -LiteralPath $ownerScriptLink -Force
+    ) 'rejected owner-script swap still launched Terminal'
+    Get-ChildItem -LiteralPath $stateDirectory -Filter 'claude-owner-setup-*.command' -Force |
+        Remove-Item -Force
 
     $ownerSpec = New-OwnerSetupLaunchSpec -Worktree $linkedWorktree `
         -StateDirectory $stateDirectory -Installed $true -Platform 'MacOS'
