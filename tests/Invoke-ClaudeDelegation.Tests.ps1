@@ -594,7 +594,7 @@ echo 2.1.211 ^(Claude Code^)
 exit /b 0
 :modes
 if "%CLAUDE_FAKE_MODE%"=="timeout" (
-  ping 127.0.0.1 -n 6 >nul
+  ping 127.0.0.1 -n 10 >nul
   exit /b 0
 )
 if "%CLAUDE_FAKE_MODE%"=="no-stdin" (
@@ -952,7 +952,9 @@ exit /b 0
     $timeoutRecord = @($ledger.tasks)[-1]
     Assert-True ($timeoutRecord.status -eq 'needs-review') 'timeout must require review'
     Assert-True ([bool]$timeoutRecord.attempts[0].timedOut) "timeout attempt was not identified; elapsed=$($timeoutStopwatch.Elapsed.TotalSeconds) exit=$($timeoutRecord.exitCode) stderr=$(Get-Content -Raw -LiteralPath $timeoutRecord.rawErrorPath)"
-    Assert-True ($timeoutStopwatch.Elapsed.TotalSeconds -lt 4) 'timeout waited for a descendant that inherited the output pipe'
+    Assert-True (
+        $timeoutStopwatch.Elapsed.TotalSeconds -lt 6
+    ) "timeout waited for a descendant that inherited the output pipe; elapsed=$($timeoutStopwatch.Elapsed.TotalSeconds)"
 
     $largeInputTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
     $largeInputTask.id = 'task-large-input'
