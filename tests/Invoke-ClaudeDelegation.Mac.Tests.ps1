@@ -101,8 +101,15 @@ function Assert-StringArrayShape([object]$Value, [string]$Name) {
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $runner = Join-Path $repositoryRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1'
-$pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop).Source
+$pwshCommand = Get-Command pwsh -CommandType Application -ErrorAction Stop |
+    Select-Object -First 1
+$pwsh = [string]$pwshCommand.Path
 Assert-True (Test-Path -LiteralPath $runner -PathType Leaf) 'delegation runner must exist'
+Assert-True (
+    -not [string]::IsNullOrWhiteSpace($pwsh) -and
+    [System.IO.Path]::IsPathRooted($pwsh) -and
+    (Test-Path -LiteralPath $pwsh -PathType Leaf)
+) 'macOS test must select one absolute pwsh executable path'
 
 . $runner -LibraryMode
 
