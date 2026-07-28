@@ -179,4 +179,3 @@ accept its own work.
 - The README contains complete terminal-first installation, verification,
   first-use, update, uninstall, and troubleshooting procedures.
 - All published commands are checked against current official documentation.
-
