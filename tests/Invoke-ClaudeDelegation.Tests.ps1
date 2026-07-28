@@ -22,6 +22,38 @@ function Invoke-TestGit([string]$Path, [string[]]$Arguments) {
     return $output
 }
 
+function Remove-TestFixtureTree([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+
+    $directories = New-Object 'System.Collections.Generic.Stack[string]'
+    $reparsePoints = New-Object 'System.Collections.Generic.List[object]'
+    $directories.Push($Path)
+
+    while ($directories.Count -gt 0) {
+        $directory = $directories.Pop()
+        foreach ($item in Get-ChildItem -LiteralPath $directory -Force) {
+            $isReparsePoint = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            if ($isReparsePoint) {
+                $reparsePoints.Add([pscustomobject]@{
+                    Path = $item.FullName
+                    IsDirectory = [bool]$item.PSIsContainer
+                })
+            } elseif ($item.PSIsContainer -and $item.Name -ne '.git') {
+                $directories.Push($item.FullName)
+            }
+        }
+    }
+
+    foreach ($reparsePoint in $reparsePoints) {
+        if ($reparsePoint.IsDirectory) {
+            [System.IO.Directory]::Delete($reparsePoint.Path, $false)
+        } else {
+            [System.IO.File]::Delete($reparsePoint.Path)
+        }
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
 Assert-True (Test-Path -LiteralPath $TaskExample) 'task example must exist'
 Assert-True (Test-Path -LiteralPath $ResultSchema) 'result schema must exist'
 
@@ -497,6 +529,24 @@ try { Assert-DelegationPolicy -Task $oversizedTeam } catch { $oversizedRejected 
 Assert-True $oversizedRejected 'agent team with more than three workstreams and no justification was accepted'
 $oversizedTeam | Add-Member -NotePropertyName parallelismJustification -NotePropertyValue 'Four disjoint platform adapters must be completed within the bounded task limits.'
 Assert-DelegationPolicy -Task $oversizedTeam
+
+$cleanupProbeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-delegation-cleanup-probe-" + [guid]::NewGuid())
+$cleanupProbeExternal = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-delegation-cleanup-external-" + [guid]::NewGuid())
+try {
+    New-Item -ItemType Directory -Path (Join-Path $cleanupProbeRoot 'nested') -Force | Out-Null
+    New-Item -ItemType Directory -Path $cleanupProbeExternal -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $cleanupProbeExternal 'must-survive.txt') -Value 'external'
+    New-Item -ItemType Junction -Path (Join-Path $cleanupProbeRoot 'nested/external-alias') -Target $cleanupProbeExternal | Out-Null
+
+    Remove-TestFixtureTree -Path $cleanupProbeRoot
+
+    Assert-True (-not (Test-Path -LiteralPath $cleanupProbeRoot)) 'fixture cleanup left a tree containing a directory junction'
+    Assert-True (Test-Path -LiteralPath (Join-Path $cleanupProbeExternal 'must-survive.txt')) 'fixture cleanup traversed a directory junction'
+} finally {
+    if (Test-Path -LiteralPath $cleanupProbeExternal) {
+        Remove-Item -LiteralPath $cleanupProbeExternal -Recurse -Force
+    }
+}
 
 $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("claude-delegation-" + [guid]::NewGuid())
 $mainRepo = Join-Path $fixtureRoot 'main'
@@ -1316,7 +1366,7 @@ exit /b 0
 } finally {
     try {
         if (Test-Path -LiteralPath $fixtureRoot) {
-            Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction Stop
+            Remove-TestFixtureTree -Path $fixtureRoot
         }
         $fixtureCleaned = -not (Test-Path -LiteralPath $fixtureRoot)
     } catch {
