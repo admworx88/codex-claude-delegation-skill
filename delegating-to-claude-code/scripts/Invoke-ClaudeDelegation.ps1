@@ -61,8 +61,9 @@ function Get-PathIdentityKeyUnion([hashtable]$Before, [hashtable]$After, [string
 
 function Get-WorktreeContext([string]$WorktreePath) {
     $resolved = Resolve-AbsolutePath $WorktreePath
+    $prefix = Invoke-Git $resolved @('rev-parse', '--show-prefix')
     $topLevel = Resolve-AbsolutePath (Invoke-Git $resolved @('rev-parse', '--show-toplevel'))
-    if (-not (Test-CanonicalPathEqual -Left $resolved -Right $topLevel -Platform (Get-DelegationPlatform))) {
+    if (-not [string]::IsNullOrEmpty($prefix)) {
         throw "WorktreePath must be the linked worktree root: $topLevel"
     }
     $gitDir = Resolve-AbsolutePath (Invoke-Git $topLevel @('rev-parse', '--absolute-git-dir'))

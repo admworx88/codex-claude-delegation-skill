@@ -48,6 +48,44 @@ Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComp
 Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
 Assert-True (-not (Test-CanonicalPathEqual -Left '/Users/delegation/Task.json' -Right '/Users/delegation/task.json' -Platform 'MacOS')) 'macOS canonical paths must compare case-sensitively'
 
+$macAliasOriginalResolveAbsolutePath = ${function:Resolve-AbsolutePath}
+$macAliasOriginalInvokeGit = ${function:Invoke-Git}
+$macAliasOriginalGetDelegationPlatform = ${function:Get-DelegationPlatform}
+try {
+    function Resolve-AbsolutePath([string]$Path) { return $Path.TrimEnd('/', '\') }
+    function Get-DelegationPlatform { return 'MacOS' }
+    function Invoke-Git([string]$Path, [string[]]$Arguments) {
+        $operation = $Arguments -join ' '
+        switch ($operation) {
+            'rev-parse --show-prefix' {
+                if ($Path -ceq '/var/folders/delegation/linked/nested') { return 'nested/' }
+                return ''
+            }
+            'rev-parse --show-toplevel' { return '/private/var/folders/delegation/linked' }
+            'rev-parse --absolute-git-dir' { return '/private/var/folders/delegation/main/.git/worktrees/linked' }
+            'rev-parse --git-common-dir' { return '/private/var/folders/delegation/main/.git' }
+            'branch --show-current' { return 'feature/mac-alias' }
+            default { throw "Unexpected alias-regression Git operation: $operation" }
+        }
+    }
+
+    $macAliasContext = Get-WorktreeContext -WorktreePath '/var/folders/delegation/linked'
+    Assert-True ($macAliasContext.worktreePath -ceq '/private/var/folders/delegation/linked') 'Git top level must be authoritative across the macOS /var alias'
+    Assert-True ($macAliasContext.branch -ceq 'feature/mac-alias') 'macOS alias context lost the linked branch'
+
+    $macAliasNestedRejected = $false
+    try {
+        Get-WorktreeContext -WorktreePath '/var/folders/delegation/linked/nested' | Out-Null
+    } catch {
+        $macAliasNestedRejected = $true
+    }
+    Assert-True $macAliasNestedRejected 'non-empty Git prefix must reject a nested macOS worktree path'
+} finally {
+    Set-Item Function:\Resolve-AbsolutePath -Value $macAliasOriginalResolveAbsolutePath
+    Set-Item Function:\Invoke-Git -Value $macAliasOriginalInvokeGit
+    Set-Item Function:\Get-DelegationPlatform -Value $macAliasOriginalGetDelegationPlatform
+}
+
 $ownerSetupWindowsWorktree = 'C:\Delegation Worktree'
 $ownerSetupWindowsState = Join-Path $ownerSetupWindowsWorktree '.codex/claude-handoff'
 foreach ($installed in @($false, $true)) {
