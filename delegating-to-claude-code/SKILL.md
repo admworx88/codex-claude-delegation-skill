@@ -84,8 +84,19 @@ review, not as acceptance.
 
 ## Invoke the runner
 
+Select the command from the current host before invoking the packet:
+
+| Host | Runner command | Owner setup |
+|---|---|---|
+| Windows | `powershell -NoProfile -ExecutionPolicy Bypass -File ...` | Visible Windows PowerShell window |
+| macOS | `pwsh -NoProfile -File ...` | Visible macOS Terminal window |
+
+Windows requires Windows PowerShell 5.1 or later. macOS requires PowerShell 7.
+On any other host, stop and report that the runner supports only Windows and
+macOS. Do not improvise another shell, runner, or hidden setup flow.
+
 Use absolute paths. First inspect a dry run, then invoke the same validated
-packet:
+packet. On Windows:
 
 ```powershell
 $runner = "<skill-directory>\scripts\Invoke-ClaudeDelegation.ps1"
@@ -99,15 +110,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $runner `
   -WorktreePath $worktree -TaskPacketPath $packet
 ```
 
+On macOS:
+
+```powershell
+$runner = "<skill-directory>/scripts/Invoke-ClaudeDelegation.ps1"
+$worktree = "<absolute-linked-feature-worktree>"
+$packet = "$worktree/.codex/claude-handoff/<task-id>.json"
+
+pwsh -NoProfile -File $runner `
+  -WorktreePath $worktree -TaskPacketPath $packet -DryRun
+
+pwsh -NoProfile -File $runner `
+  -WorktreePath $worktree -TaskPacketPath $packet
+```
+
 Wait for the top-level invocation to finish. Review it before preparing any
 revision packet or starting the next sequential delegation.
 
 ## Require owner-visible CLI setup
 
 If Claude Code CLI is missing or unauthenticated, stop delegation. The runner
-records `waiting-for-owner`, opens a visible owner setup/authentication window,
-and exits with an error. Tell the owner what action is required and wait. Do not
-install, authenticate, substitute another command, or hide the interruption.
+records `waiting-for-owner`, opens the platform's visible owner
+setup/authentication window from the ignored handoff directory, and exits with
+an error. On Windows this is a Windows PowerShell window. On macOS this is
+macOS Terminal. Tell the owner what action is required and wait. Do not install,
+authenticate, substitute another command, hide the interruption, or add
+`--dangerously-skip-permissions` to the setup window. After the owner finishes,
+rerun the same guarded command and packet.
 
 ## Review and verify independently
 
