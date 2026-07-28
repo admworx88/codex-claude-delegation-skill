@@ -1,0 +1,32 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Windows test suite
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\Invoke-ClaudeDelegation.Tests.ps1
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure PowerShell is available
+        shell: bash
+        run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            brew install --cask powershell
+          fi
+          pwsh --version
+      - name: Run macOS test suite
+        shell: bash
+        run: pwsh -NoProfile -File ./tests/Invoke-ClaudeDelegation.Mac.Tests.ps1

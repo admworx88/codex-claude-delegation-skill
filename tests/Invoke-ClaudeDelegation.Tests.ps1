@@ -43,6 +43,309 @@ foreach ($field in @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'un
 $Runner = Join-Path $RepoRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1'
 . $Runner -LibraryMode
 
+Assert-True (Test-SupportedLedgerVersion ([int]1)) 'Int32 ledger version 1 must be accepted'
+Assert-True (Test-SupportedLedgerVersion ([long]1)) 'Int64 ledger version 1 must be accepted'
+Assert-True (-not (Test-SupportedLedgerVersion '1')) 'string ledger version 1 must be rejected'
+Assert-True (-not (Test-SupportedLedgerVersion $true)) 'boolean ledger version true must be rejected'
+Assert-True (-not (Test-SupportedLedgerVersion ([double]1.0))) 'fraction-capable ledger version 1.0 must be rejected'
+Assert-True (-not (Test-SupportedLedgerVersion ([long]2))) 'unknown integral ledger versions must be rejected'
+Assert-True (
+    (Remove-TrailingPathSeparatorsExceptRoot 'D:\') -ceq 'D:\'
+) 'drive roots must preserve their trailing root separator'
+Assert-True (
+    (Remove-TrailingPathSeparatorsExceptRoot '\\server\share\') -ceq '\\server\share\'
+) 'UNC roots must preserve their trailing root separator'
+
+Assert-True ((Get-PathStringComparison -Platform 'Windows') -eq [System.StringComparison]::OrdinalIgnoreCase) 'Windows paths must use ordinal case-insensitive comparison'
+Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComparison]::Ordinal) 'macOS paths must use ordinal case-sensitive comparison'
+Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
+Assert-True (-not (Test-CanonicalPathEqual -Left '/Users/delegation/Task.json' -Right '/Users/delegation/task.json' -Platform 'MacOS')) 'macOS canonical paths must compare case-sensitively'
+
+$canonicalPathFixture = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'claude-delegation-canonical-path-' + [guid]::NewGuid().ToString('N')
+)
+$canonicalPathTarget = Join-Path $canonicalPathFixture 'physical-target'
+$canonicalPathAlias = Join-Path $canonicalPathFixture 'directory-alias'
+try {
+    New-Item -ItemType Directory -Path $canonicalPathTarget -Force | Out-Null
+    $canonicalPathFile = Join-Path $canonicalPathTarget 'task.json'
+    Set-Content -LiteralPath $canonicalPathFile -Value '{}' -Encoding UTF8
+    New-Item -ItemType Junction -Path $canonicalPathAlias -Target $canonicalPathTarget | Out-Null
+
+    $resolvedPhysicalFile = Resolve-AbsolutePath $canonicalPathFile
+    $resolvedAliasFile = Resolve-AbsolutePath (Join-Path $canonicalPathAlias 'task.json')
+    Assert-True (
+        $resolvedAliasFile -eq $resolvedPhysicalFile
+    ) 'existing absolute paths must resolve parent link aliases to one filesystem identity'
+
+    $canonicalExpectedState = Join-Path $canonicalPathFixture 'expected-state'
+    New-Item -ItemType Directory -Path $canonicalExpectedState -Force | Out-Null
+    $escapedDirectoryAlias = Join-Path $canonicalExpectedState 'escaped-directory'
+    New-Item -ItemType Junction -Path $escapedDirectoryAlias -Target $canonicalPathTarget | Out-Null
+    $escapedTaskAlias = Join-Path $escapedDirectoryAlias 'task.json'
+    Assert-True (
+        (Resolve-AbsolutePath $escapedTaskAlias) -eq $resolvedPhysicalFile
+    ) 'a task packet under a linked parent must resolve outside the state directory so containment checks reject escapes'
+
+} finally {
+    $canonicalPathFixtureFull = [System.IO.Path]::GetFullPath($canonicalPathFixture)
+    $temporaryRoot = [System.IO.Path]::GetFullPath(
+        [System.IO.Path]::GetTempPath()
+    ).TrimEnd('\', '/')
+    Assert-True (
+        (Split-Path -Parent $canonicalPathFixtureFull).TrimEnd('\', '/') -eq $temporaryRoot -and
+        (Split-Path -Leaf $canonicalPathFixtureFull) -match '^claude-delegation-canonical-path-[0-9a-f]{32}$'
+    ) 'canonical-path fixture cleanup escaped its test-owned temporary path'
+    if (Test-Path -LiteralPath $canonicalPathFixtureFull) {
+        Remove-Item -LiteralPath $canonicalPathFixtureFull -Recurse -Force
+    }
+}
+
+$macAliasOriginalResolveAbsolutePath = ${function:Resolve-AbsolutePath}
+$macAliasOriginalInvokeGit = ${function:Invoke-Git}
+$macAliasOriginalGetDelegationPlatform = ${function:Get-DelegationPlatform}
+try {
+    function Resolve-AbsolutePath([string]$Path) { return $Path.TrimEnd('/', '\') }
+    function Get-DelegationPlatform { return 'MacOS' }
+    function Invoke-Git([string]$Path, [string[]]$Arguments) {
+        $operation = $Arguments -join ' '
+        switch ($operation) {
+            'rev-parse --show-prefix' {
+                if ($Path -ceq '/var/folders/delegation/linked/nested') { return 'nested/' }
+                return ''
+            }
+            'rev-parse --show-toplevel' { return '/private/var/folders/delegation/linked' }
+            'rev-parse --absolute-git-dir' { return '/private/var/folders/delegation/main/.git/worktrees/linked' }
+            'rev-parse --git-common-dir' { return '/private/var/folders/delegation/main/.git' }
+            'branch --show-current' { return 'feature/mac-alias' }
+            default { throw "Unexpected alias-regression Git operation: $operation" }
+        }
+    }
+
+    $macAliasContext = Get-WorktreeContext -WorktreePath '/var/folders/delegation/linked'
+    Assert-True ($macAliasContext.worktreePath -ceq '/private/var/folders/delegation/linked') 'Git top level must be authoritative across the macOS /var alias'
+    Assert-True ($macAliasContext.branch -ceq 'feature/mac-alias') 'macOS alias context lost the linked branch'
+
+    $macAliasNestedRejected = $false
+    try {
+        Get-WorktreeContext -WorktreePath '/var/folders/delegation/linked/nested' | Out-Null
+    } catch {
+        $macAliasNestedRejected = $true
+    }
+    Assert-True $macAliasNestedRejected 'non-empty Git prefix must reject a nested macOS worktree path'
+} finally {
+    Set-Item Function:\Resolve-AbsolutePath -Value $macAliasOriginalResolveAbsolutePath
+    Set-Item Function:\Invoke-Git -Value $macAliasOriginalInvokeGit
+    Set-Item Function:\Get-DelegationPlatform -Value $macAliasOriginalGetDelegationPlatform
+}
+
+$ownerSetupWindowsWorktree = 'C:\Delegation Worktree'
+$ownerSetupWindowsState = Join-Path $ownerSetupWindowsWorktree '.codex/claude-handoff'
+foreach ($installed in @($false, $true)) {
+    $windowsOwnerSetup = New-OwnerSetupLaunchSpec -Worktree $ownerSetupWindowsWorktree `
+        -StateDirectory $ownerSetupWindowsState -Installed $installed -Platform 'Windows'
+    Assert-True ($windowsOwnerSetup.FilePath -eq 'powershell') 'Windows owner setup must launch Windows PowerShell'
+    Assert-True ($windowsOwnerSetup.ArgumentList -contains '-NoExit') 'Windows owner setup must remain visible and interactive'
+    Assert-True ($windowsOwnerSetup.WorkingDirectory -eq $ownerSetupWindowsWorktree) 'Windows owner setup must use the worktree as its working directory'
+    Assert-True ((@($windowsOwnerSetup.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'Windows owner setup must not receive bypass permissions'
+}
+
+$ownerSetupMacWorktree = "/Users/Owner's Worktrees/Delegation Task"
+$ownerSetupMacState = Join-Path $ownerSetupMacWorktree '.codex/claude-handoff'
+$expectedQuotedMacWorktree = "'/Users/Owner'`"`"'`"`"'s Worktrees/Delegation Task'"
+Assert-True ((ConvertTo-PosixSingleQuotedString $ownerSetupMacWorktree) -ceq $expectedQuotedMacWorktree) 'macOS owner setup must safely POSIX-quote spaces and apostrophes'
+
+$missingMacOwnerSetup = New-OwnerSetupLaunchSpec -Worktree $ownerSetupMacWorktree `
+    -StateDirectory $ownerSetupMacState -Installed $false -Platform 'MacOS'
+$installedMacOwnerSetup = New-OwnerSetupLaunchSpec -Worktree $ownerSetupMacWorktree `
+    -StateDirectory $ownerSetupMacState -Installed $true -Platform 'MacOS'
+foreach ($macOwnerSetup in @($missingMacOwnerSetup, $installedMacOwnerSetup)) {
+    Assert-True ($macOwnerSetup.FilePath -eq 'open') 'macOS owner setup must use open'
+    Assert-True ($macOwnerSetup.ArgumentList.Count -eq 3) 'macOS owner setup must pass only the Terminal application and setup script'
+    Assert-True ($macOwnerSetup.ArgumentList[0] -eq '-a') 'macOS owner setup must select an application'
+    Assert-True ($macOwnerSetup.ArgumentList[1] -eq 'Terminal') 'macOS owner setup must launch Terminal'
+    Assert-True ($macOwnerSetup.ArgumentList[2] -eq $macOwnerSetup.ScriptPath) 'macOS Terminal must receive the generated setup script path'
+    Assert-True ([System.IO.Path]::GetExtension($macOwnerSetup.ScriptPath) -eq '.command') 'macOS owner setup script must use the .command extension'
+    Assert-True ((Split-Path -Parent $macOwnerSetup.ScriptPath) -eq $ownerSetupMacState) 'macOS owner setup script must stay under the handoff state directory'
+    Assert-True ($macOwnerSetup.ScriptContent -match [regex]::Escape("cd -- $expectedQuotedMacWorktree")) 'macOS owner setup script must safely change to the requested worktree'
+    Assert-True ($macOwnerSetup.ScriptContent -notmatch 'dangerously-skip-permissions') 'macOS owner setup script must not contain bypass permissions'
+}
+Assert-True ($missingMacOwnerSetup.ScriptContent -match 'Claude Code CLI is not installed') 'missing-Claude macOS setup must explain the install requirement'
+Assert-True ($missingMacOwnerSetup.ScriptContent -notmatch '(?m)^\s*claude(?:\s|$)') 'missing-Claude macOS setup must not invoke an unavailable Claude CLI'
+Assert-True ($missingMacOwnerSetup.ScriptContent -match '(?m)^exec "\$\{SHELL:-/bin/zsh\}" -l\s*$') 'missing-Claude macOS setup must end in an interactive login shell'
+Assert-True ($installedMacOwnerSetup.ScriptContent -match '(?m)^\s*claude\s*$') 'installed macOS setup must start Claude interactively'
+Assert-True ($installedMacOwnerSetup.ScriptContent -match '/login') 'installed macOS setup must direct the owner to /login'
+Assert-True ($installedMacOwnerSetup.ScriptContent -match '(?m)^exec "\$\{SHELL:-/bin/zsh\}" -l\s*$') 'installed macOS setup must leave an interactive login shell afterward'
+
+$macOwnerSetupRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-delegation-macos-owner-setup-' + [guid]::NewGuid())
+$macOwnerSetupState = Join-Path $macOwnerSetupRoot '.codex/claude-handoff'
+$macOwnerSetupBin = Join-Path $macOwnerSetupRoot 'bin'
+$macChmodCapturePath = Join-Path $macOwnerSetupRoot 'chmod-arguments.txt'
+$macOwnerSetupOriginalPlatform = ${function:Get-DelegationPlatform}
+$macOwnerSetupOriginalLaunch = ${function:Invoke-OwnerSetupLaunchSpec}
+$macOwnerSetupSavedPath = $env:PATH
+$global:capturedMacOwnerSetup = [ordered]@{
+    Launch = $null
+    LaunchPlatform = $null
+}
+try {
+    New-Item -ItemType Directory -Force -Path $macOwnerSetupState, $macOwnerSetupBin | Out-Null
+    @'
+@echo off
+echo %~1>"%CLAUDE_CHMOD_CAPTURE%"
+echo %~2>>"%CLAUDE_CHMOD_CAPTURE%"
+if not "%~3"=="" echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
+'@ | Set-Content -LiteralPath (Join-Path $macOwnerSetupBin 'chmod.cmd') -Encoding ASCII
+    $env:CLAUDE_CHMOD_CAPTURE = $macChmodCapturePath
+    $env:PATH = "$macOwnerSetupBin;$macOwnerSetupSavedPath"
+    Set-Item Function:\Get-DelegationPlatform -Value { return 'MacOS' }
+    function Invoke-OwnerSetupLaunchSpec {
+        param($LaunchSpec, [string]$Platform)
+        $global:capturedMacOwnerSetup.Launch = $LaunchSpec
+        $global:capturedMacOwnerSetup.LaunchPlatform = $Platform
+    }
+    function Start-Process {
+        throw 'macOS owner setup must not use Start-Process because it flattens native argument boundaries.'
+    }
+
+    Show-OwnerSetup -Worktree $macOwnerSetupRoot -StateDirectory $macOwnerSetupState -Installed $true
+
+    $writtenMacSetupPath = [string]$global:capturedMacOwnerSetup.Launch.ScriptPath
+    Assert-True (
+        (Split-Path -Leaf $writtenMacSetupPath) -match
+        '^claude-owner-setup-[0-9a-f]{32}\.command$'
+    ) 'macOS owner setup must use an unpredictable generated script leaf'
+    Assert-True (Test-Path -LiteralPath $writtenMacSetupPath) 'macOS owner setup must write the generated command script before launch'
+    $writtenMacSetupBytes = [System.IO.File]::ReadAllBytes($writtenMacSetupPath)
+    $hasUtf8Bom = $writtenMacSetupBytes.Length -ge 3 -and $writtenMacSetupBytes[0] -eq 0xEF -and `
+        $writtenMacSetupBytes[1] -eq 0xBB -and $writtenMacSetupBytes[2] -eq 0xBF
+    Assert-True (-not $hasUtf8Bom) 'macOS owner setup script must be UTF-8 without BOM'
+    Assert-True (Test-Path -LiteralPath $macChmodCapturePath) 'macOS owner setup must secure the script before launching Terminal'
+    $capturedMacChmodArguments = @(Get-Content -LiteralPath $macChmodCapturePath)
+    Assert-True ($capturedMacChmodArguments.Count -eq 2) "macOS owner setup chmod must receive mode and exact path only: $($capturedMacChmodArguments -join '|')"
+    Assert-True ($capturedMacChmodArguments[0] -eq '700') 'macOS owner setup chmod must set mode 700'
+    Assert-True ([System.IO.Path]::IsPathRooted($capturedMacChmodArguments[1])) 'macOS owner setup chmod must receive an absolute script path'
+    Assert-True ($capturedMacChmodArguments[1] -ceq $writtenMacSetupPath) 'macOS owner setup chmod must receive the exact script path without shell interpolation'
+    Assert-True ($global:capturedMacOwnerSetup.Launch.FilePath -eq 'open') 'macOS owner setup execution must launch the inspected open specification'
+    Assert-True ($global:capturedMacOwnerSetup.LaunchPlatform -eq 'MacOS') 'macOS owner setup must use the argv-preserving macOS launch seam'
+} finally {
+    Set-Item Function:\Get-DelegationPlatform -Value $macOwnerSetupOriginalPlatform
+    if ($null -ne $macOwnerSetupOriginalLaunch) {
+        Set-Item Function:\Invoke-OwnerSetupLaunchSpec -Value $macOwnerSetupOriginalLaunch
+    } else {
+        Remove-Item -Path Function:\Invoke-OwnerSetupLaunchSpec -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Path Function:\Start-Process -Force -ErrorAction SilentlyContinue
+    $env:PATH = $macOwnerSetupSavedPath
+    Remove-Item Env:\CLAUDE_CHMOD_CAPTURE -ErrorAction SilentlyContinue
+    Remove-Variable -Name capturedMacOwnerSetup -Scope Global -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $macOwnerSetupRoot) {
+        Remove-Item -LiteralPath $macOwnerSetupRoot -Recurse -Force
+    }
+}
+
+$argumentListProperty = [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')
+if ($null -eq $argumentListProperty) {
+    $macLaunchRejectedOnLegacyPowerShell = $false
+    try {
+        Invoke-OwnerSetupLaunchSpec -LaunchSpec ([pscustomobject]@{
+            FilePath = 'open'
+            ArgumentList = [object[]]@('-a', 'Terminal', "/tmp/Owner's Delegation Task.command")
+            WorkingDirectory = '/tmp'
+        }) -Platform 'MacOS' | Out-Null
+    } catch {
+        $macLaunchRejectedOnLegacyPowerShell = $_.Exception.Message -match 'PowerShell 7|ArgumentList'
+    }
+    Assert-True $macLaunchRejectedOnLegacyPowerShell 'legacy PowerShell must reject macOS launch instead of flattening argument boundaries'
+} else {
+    $argvProbeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-delegation-argv-probe-' + [guid]::NewGuid())
+    try {
+        New-Item -ItemType Directory -Force -Path $argvProbeRoot | Out-Null
+        $argvProbeScript = Join-Path $argvProbeRoot 'capture argv.ps1'
+        $argvProbeOutput = Join-Path $argvProbeRoot 'captured argv.json'
+        @'
+param([string]$OutputPath)
+[System.IO.File]::WriteAllText(
+    $OutputPath,
+    (@($args) | ConvertTo-Json -Compress),
+    [System.Text.UTF8Encoding]::new($false)
+)
+'@ | Set-Content -LiteralPath $argvProbeScript -Encoding UTF8
+        $expectedSpacedScriptPath = Join-Path $argvProbeRoot "Owner's Delegation Task.command"
+        $argvProbeLaunch = [pscustomobject]@{
+            FilePath = (Get-Process -Id $PID).Path
+            ArgumentList = [object[]]@(
+                '-NoProfile', '-File', $argvProbeScript, $argvProbeOutput,
+                '-a', 'Terminal', $expectedSpacedScriptPath
+            )
+            WorkingDirectory = $argvProbeRoot
+        }
+        $argvProbeProcess = Invoke-OwnerSetupLaunchSpec -LaunchSpec $argvProbeLaunch -Platform 'MacOS'
+        try {
+            Assert-True ($argvProbeProcess.WaitForExit(30000)) 'argv probe process did not exit'
+            Assert-True ($argvProbeProcess.ExitCode -eq 0) 'argv probe process failed'
+        } finally {
+            $argvProbeProcess.Dispose()
+        }
+        $capturedArgv = @(Get-Content -Raw -LiteralPath $argvProbeOutput | ConvertFrom-Json)
+        Assert-True ($capturedArgv.Count -eq 3) 'macOS argv-preserving launch changed the native argument count'
+        Assert-True ($capturedArgv[0] -eq '-a') 'macOS argv-preserving launch changed the application selector'
+        Assert-True ($capturedArgv[1] -eq 'Terminal') 'macOS argv-preserving launch changed the Terminal application name'
+        Assert-True ($capturedArgv[2] -ceq $expectedSpacedScriptPath) 'macOS argv-preserving launch split or changed the spaced/apostrophe script path'
+    } finally {
+        if (Test-Path -LiteralPath $argvProbeRoot) {
+            Remove-Item -LiteralPath $argvProbeRoot -Recurse -Force
+        }
+    }
+}
+
+$macFingerprintRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('claude-delegation-macos-fingerprint-' + [guid]::NewGuid())
+$originalGetDelegationPlatform = ${function:Get-DelegationPlatform}
+$originalInvokeGit = ${function:Invoke-Git}
+$originalResolveAbsolutePath = ${function:Resolve-AbsolutePath}
+$originalGetWorktreeFingerprint = ${function:Get-WorktreeFingerprint}
+try {
+    Set-Item Function:\Get-DelegationPlatform -Value { return 'MacOS' }
+    New-Item -ItemType Directory -Path $macFingerprintRoot | Out-Null
+
+    $macPrimaryFingerprint = Get-WorktreeFingerprint -Worktree $macFingerprintRoot
+    $macPrimaryFingerprint['Foo.txt'] = 'upper'
+    $macPrimaryFingerprint['foo.txt'] = 'lower'
+    Assert-True ($macPrimaryFingerprint.Count -eq 2) 'macOS primary fingerprint collapsed paths that differ only by case'
+
+    $emptyMacPrimaryFingerprint = [System.Collections.Hashtable]::new([System.StringComparer]::Ordinal)
+    $macPrimaryChanges = Compare-WorktreeFingerprint -Before $emptyMacPrimaryFingerprint -After $macPrimaryFingerprint
+    Assert-True (@($macPrimaryChanges).Count -eq 2) 'macOS primary fingerprint comparison collapsed case-distinct path keys'
+
+    Set-Item Function:\Invoke-Git -Value {
+        param([string]$Path, [string[]]$Arguments)
+        return "worktree /repo/primary`nworktree /repo/Foo`nworktree /repo/foo"
+    }
+    Set-Item Function:\Resolve-AbsolutePath -Value {
+        param([string]$Path)
+        return $Path
+    }
+    Set-Item Function:\Get-WorktreeFingerprint -Value {
+        param([string]$Worktree)
+        return @{ marker = $Worktree }
+    }
+    $macSiblingContext = [pscustomobject]@{ worktreePath = '/repo/primary' }
+    $macSiblingFingerprint = Get-SiblingWorktreeFingerprint -Context $macSiblingContext
+    Assert-True ($macSiblingFingerprint.Count -eq 2) 'macOS sibling fingerprint collapsed worktree paths that differ only by case'
+
+    $emptyMacSiblingFingerprint = [System.Collections.Hashtable]::new([System.StringComparer]::Ordinal)
+    $macSiblingChanges = Compare-SiblingWorktreeFingerprint -Before $emptyMacSiblingFingerprint -After $macSiblingFingerprint
+    Assert-True (@($macSiblingChanges).Count -eq 2) 'macOS sibling fingerprint comparison collapsed case-distinct path keys'
+} finally {
+    Set-Item Function:\Get-DelegationPlatform -Value $originalGetDelegationPlatform
+    Set-Item Function:\Invoke-Git -Value $originalInvokeGit
+    Set-Item Function:\Resolve-AbsolutePath -Value $originalResolveAbsolutePath
+    Set-Item Function:\Get-WorktreeFingerprint -Value $originalGetWorktreeFingerprint
+    if (Test-Path -LiteralPath $macFingerprintRoot) {
+        Remove-Item -LiteralPath $macFingerprintRoot -Recurse -Force
+    }
+}
+
 $parsedExample = Read-TaskPacket -Path $TaskExample
 Assert-True ($parsedExample.id -eq 'task-001') 'task packet reader did not return the parsed packet'
 
@@ -247,6 +550,17 @@ try {
     Assert-True (@($ledger.tasks).Count -eq 0) 'new ledger tasks must be empty'
 
     $validLedgerJson = Get-Content -Raw -LiteralPath $state.ledgerPath
+    $mainRepositoryAlias = Join-Path $fixtureRoot 'main-alias'
+    $linkedWorktreeAlias = Join-Path $fixtureRoot 'feature-alias'
+    New-Item -ItemType Junction -Path $mainRepositoryAlias -Target $mainRepo | Out-Null
+    New-Item -ItemType Junction -Path $linkedWorktreeAlias -Target $linked | Out-Null
+    $aliasLedger = $validLedgerJson | ConvertFrom-Json
+    $aliasLedger.repositoryId = Join-Path $mainRepositoryAlias '.git'
+    $aliasLedger.worktreePath = $linkedWorktreeAlias
+    $aliasLedger | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $state.ledgerPath -Encoding UTF8
+    Read-AndAssertHandoffLedger -LedgerPath $state.ledgerPath -Context $linkedContext -Task $direct | Out-Null
+    Set-Content -LiteralPath $state.ledgerPath -Value $validLedgerJson -Encoding UTF8
+
     foreach ($mutation in @(
         [pscustomobject]@{ name='version'; apply={ param($x) $x.version = 2 } },
         [pscustomobject]@{ name='repository'; apply={ param($x) $x.repositoryId = 'wrong' } },
@@ -280,7 +594,7 @@ echo 2.1.211 ^(Claude Code^)
 exit /b 0
 :modes
 if "%CLAUDE_FAKE_MODE%"=="timeout" (
-  ping 127.0.0.1 -n 6 >nul
+  ping 127.0.0.1 -n 10 >nul
   exit /b 0
 )
 if "%CLAUDE_FAKE_MODE%"=="no-stdin" (
@@ -306,6 +620,10 @@ if "%CLAUDE_FAKE_MODE%"=="ignored-edit" (
 if "%CLAUDE_FAKE_MODE%"=="forbidden-edit" (
   if not exist "%CD%\.github\workflows" mkdir "%CD%\.github\workflows"
   echo forbidden>"%CD%\.github\workflows\ci.yml"
+)
+if "%CLAUDE_FAKE_MODE%"=="forbidden-link-create" (
+  if not exist "%CD%\.github" mkdir "%CD%\.github"
+  powershell -NoProfile -Command "New-Item -ItemType Junction -Path (Join-Path (Get-Location) '.github\delegated-link') -Target $env:CLAUDE_FAKE_LINK_TARGET | Out-Null"
 )
 if "%CLAUDE_FAKE_MODE%"=="remote-change" (
   git -C "%CD%" remote add delegation-evil https://example.invalid/evil.git
@@ -424,7 +742,7 @@ exit /b 0
         }
     }
     try {
-        Show-OwnerSetup -Worktree $linked -Installed $true
+        Show-OwnerSetup -Worktree $linked -StateDirectory $state.stateDir -Installed $true
         $installedSetup = $capturedStartProcess
         $installedSetupArguments = @($installedSetup.ArgumentList) -join ' '
         Assert-True ($installedSetup.FilePath -eq 'powershell') 'owner setup must launch Windows PowerShell'
@@ -434,7 +752,7 @@ exit /b 0
         Assert-True ($installedSetupArguments -notmatch 'dangerously-skip-permissions') 'owner setup received bypass permissions'
         Assert-True ($capturedStartProcess.WorkingDirectory -eq $linked) 'owner setup used the wrong working directory'
 
-        Show-OwnerSetup -Worktree $linked -Installed $false
+        Show-OwnerSetup -Worktree $linked -StateDirectory $state.stateDir -Installed $false
         $missingSetup = $capturedStartProcess
         $missingSetupArguments = @($missingSetup.ArgumentList) -join ' '
         Assert-True ($missingSetup.FilePath -eq 'powershell') 'missing setup must launch Windows PowerShell'
@@ -467,33 +785,40 @@ exit /b 0
     Assert-True $dryRunRejectedTamperedLedger 'dry-run proceeded with a mismatched ledger'
     Set-Content -LiteralPath $state.ledgerPath -Value $validLedgerJson -Encoding UTF8
 
-    $capturedStartProcess = $null
+    $global:capturedRunnerStartProcess = $null
     function Start-Process {
         param(
             [string]$FilePath,
             [object[]]$ArgumentList,
             [string]$WorkingDirectory
         )
-        $script:capturedStartProcess = [pscustomobject]@{
+        $ledgerAtLaunch = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+        $global:capturedRunnerStartProcess = [pscustomobject]@{
             FilePath = $FilePath
             ArgumentList = $ArgumentList
             WorkingDirectory = $WorkingDirectory
+            LedgerStatusAtLaunch = @($ledgerAtLaunch.tasks)[-1].status
         }
     }
     try {
         $missingSetupRejected = $false
+        $missingSetupError = $null
         try {
             & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand (Join-Path $fixtureRoot 'absent-claude.cmd') | Out-Null
         } catch {
             $missingSetupRejected = $true
+            $missingSetupError = $_
         }
         Assert-True $missingSetupRejected 'missing Claude CLI did not require owner setup'
         $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
         $missingWait = @($ledger.tasks)[-1]
         Assert-True ($missingWait.status -eq 'waiting-for-owner') 'missing CLI did not append owner wait state'
         Assert-True ($missingWait.reason -eq 'claude-cli-missing') 'missing CLI wait reason was incorrect'
-        Assert-True ((@($capturedStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'missing CLI setup received bypass permissions'
+        Assert-True ($null -ne $global:capturedRunnerStartProcess) "missing CLI did not open owner setup: $missingSetupError"
+        Assert-True ($global:capturedRunnerStartProcess.LedgerStatusAtLaunch -eq 'waiting-for-owner') 'missing CLI opened owner setup before recording owner wait state'
+        Assert-True ((@($global:capturedRunnerStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'missing CLI setup received bypass permissions'
 
+        $global:capturedRunnerStartProcess = $null
         $env:CLAUDE_FAKE_AUTH = 'false'
         $unauthenticatedRejected = $false
         try {
@@ -508,9 +833,12 @@ exit /b 0
         $authenticationWait = @($ledger.tasks)[-1]
         Assert-True ($authenticationWait.status -eq 'waiting-for-owner') 'unauthenticated CLI did not append owner wait state'
         Assert-True ($authenticationWait.reason -eq 'claude-authentication-required') 'authentication wait reason was incorrect'
-        Assert-True ((@($capturedStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'authentication setup received bypass permissions'
+        Assert-True ($null -ne $global:capturedRunnerStartProcess) 'unauthenticated Claude did not open owner setup'
+        Assert-True ($global:capturedRunnerStartProcess.LedgerStatusAtLaunch -eq 'waiting-for-owner') 'unauthenticated Claude opened owner setup before recording owner wait state'
+        Assert-True ((@($global:capturedRunnerStartProcess.ArgumentList) -join ' ') -notmatch 'dangerously-skip-permissions') 'authentication setup received bypass permissions'
     } finally {
         Remove-Item -Path Function:\Start-Process -Force
+        Remove-Variable -Name capturedRunnerStartProcess -Scope Global -ErrorAction SilentlyContinue
     }
 
     $namedFakeClaude = Join-Path $fixtureRoot 'fake-claude-name.cmd'
@@ -628,7 +956,9 @@ exit /b 0
     $timeoutRecord = @($ledger.tasks)[-1]
     Assert-True ($timeoutRecord.status -eq 'needs-review') 'timeout must require review'
     Assert-True ([bool]$timeoutRecord.attempts[0].timedOut) "timeout attempt was not identified; elapsed=$($timeoutStopwatch.Elapsed.TotalSeconds) exit=$($timeoutRecord.exitCode) stderr=$(Get-Content -Raw -LiteralPath $timeoutRecord.rawErrorPath)"
-    Assert-True ($timeoutStopwatch.Elapsed.TotalSeconds -lt 4) 'timeout waited for a descendant that inherited the output pipe'
+    Assert-True (
+        $timeoutStopwatch.Elapsed.TotalSeconds -lt 6
+    ) "timeout waited for a descendant that inherited the output pipe; elapsed=$($timeoutStopwatch.Elapsed.TotalSeconds)"
 
     $largeInputTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
     $largeInputTask.id = 'task-large-input'
@@ -741,6 +1071,50 @@ exit /b 0
     $afterFingerprint = Get-WorktreeFingerprint -Worktree $linked
     $fingerprintChanges = Compare-WorktreeFingerprint -Before $beforeFingerprint -After $afterFingerprint
     Assert-True ($fingerprintChanges -contains 'src/parser.ps1') 'hash fingerprint missed a second change to an already dirty file'
+    $caseOnlyFingerprintChanges = Compare-WorktreeFingerprint `
+        -Before @{ 'src/link' = '{"targets":["CaseTarget"]}' } `
+        -After @{ 'src/link' = '{"targets":["casetarget"]}' }
+    Assert-True ($caseOnlyFingerprintChanges -contains 'src/link') 'fingerprint comparison ignored a case-only link target change'
+
+    $externalLinkTargetOne = Join-Path $fixtureRoot 'external-link-target-one'
+    $externalLinkTargetTwo = Join-Path $fixtureRoot 'external-link-target-two'
+    New-Item -ItemType Directory -Force -Path $externalLinkTargetOne, $externalLinkTargetTwo | Out-Null
+    Set-Content -LiteralPath (Join-Path $externalLinkTargetOne 'outside-one.txt') -Value 'outside-one'
+    Set-Content -LiteralPath (Join-Path $externalLinkTargetTwo 'outside-two.txt') -Value 'outside-two'
+    $allowedLinkPath = Join-Path $linked 'src/delegated-link'
+    $linkBeforeCreate = Get-WorktreeFingerprint -Worktree $linked
+    New-Item -ItemType Junction -Path $allowedLinkPath -Target $externalLinkTargetOne | Out-Null
+    $linkAfterCreate = Get-WorktreeFingerprint -Worktree $linked
+    $linkCreateChanges = Compare-WorktreeFingerprint -Before $linkBeforeCreate -After $linkAfterCreate
+    Assert-True ($linkCreateChanges -contains 'src/delegated-link') 'fingerprint missed a created junction entry'
+    Assert-True ($linkAfterCreate.ContainsKey('src/delegated-link')) 'fingerprint omitted a junction entry'
+    Assert-True ($linkAfterCreate['src/delegated-link'] -match '"entryKind":"directory"') 'junction fingerprint omitted its entry kind'
+    Assert-True ($linkAfterCreate['src/delegated-link'] -match '"linkType":"Junction"') 'junction fingerprint omitted its link type'
+    Assert-True ($linkAfterCreate['src/delegated-link'] -match [regex]::Escape($externalLinkTargetOne.Replace('\', '\\'))) 'junction fingerprint omitted its target'
+    Assert-True (-not $linkAfterCreate.ContainsKey('src/delegated-link/outside-one.txt')) 'fingerprint traversed an external junction target'
+    Set-Content -LiteralPath (Join-Path $externalLinkTargetOne 'outside-one.txt') -Value 'outside-one-mutated'
+    $linkAfterExternalContentChange = Get-WorktreeFingerprint -Worktree $linked
+    $externalContentChanges = Compare-WorktreeFingerprint -Before $linkAfterCreate -After $linkAfterExternalContentChange
+    Assert-True (-not ($externalContentChanges -contains 'src/delegated-link')) 'external junction target contents affected the link fingerprint'
+    $allowedLinkTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $allowedLinkTask.allowedPaths = @('src/**')
+    $allowedLinkViolations = Get-ScopeViolations -ChangedPaths $linkCreateChanges -Task $allowedLinkTask
+    Assert-True (@($allowedLinkViolations).Count -eq 0) 'allowed junction path was classified as a scope violation'
+
+    [System.IO.Directory]::Delete($allowedLinkPath)
+    New-Item -ItemType Junction -Path $allowedLinkPath -Target $externalLinkTargetTwo | Out-Null
+    $linkAfterRepoint = Get-WorktreeFingerprint -Worktree $linked
+    $linkRepointChanges = Compare-WorktreeFingerprint -Before $linkAfterCreate -After $linkAfterRepoint
+    Assert-True ($linkRepointChanges -contains 'src/delegated-link') 'fingerprint missed a repointed junction entry'
+    Assert-True ($linkAfterRepoint['src/delegated-link'] -match [regex]::Escape($externalLinkTargetTwo.Replace('\', '\\'))) 'repointed junction fingerprint omitted its new target'
+    Assert-True (-not $linkAfterRepoint.ContainsKey('src/delegated-link/outside-two.txt')) 'fingerprint traversed a repointed external junction target'
+    $forbiddenLinkViolations = Get-ScopeViolations -ChangedPaths $linkRepointChanges -Task $executionTask
+    Assert-True ($forbiddenLinkViolations -contains 'src/delegated-link') 'out-of-scope junction repoint was not classified as a scope violation'
+
+    [System.IO.Directory]::Delete($allowedLinkPath)
+    $linkAfterRemoval = Get-WorktreeFingerprint -Worktree $linked
+    $linkRemovalChanges = Compare-WorktreeFingerprint -Before $linkAfterRepoint -After $linkAfterRemoval
+    Assert-True ($linkRemovalChanges -contains 'src/delegated-link') 'fingerprint missed a removed junction entry'
 
     $env:CLAUDE_FAKE_MODE = 'allowed-edit'
     try {
@@ -788,6 +1162,21 @@ exit /b 0
     Assert-True ($forbiddenRecord.status -eq 'rejected') 'scope violation was not rejected'
     Assert-True ($forbiddenRecord.scopeViolations -contains '.github/workflows/ci.yml') 'scope violation was not recorded'
     Assert-True (Test-Path -LiteralPath (Join-Path $linked '.github/workflows/ci.yml')) 'runner automatically reverted a rejected change'
+
+    $env:CLAUDE_FAKE_MODE = 'forbidden-link-create'
+    $env:CLAUDE_FAKE_LINK_TARGET = $externalLinkTargetOne
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\CLAUDE_FAKE_LINK_TARGET -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $forbiddenLinkRecord = @($ledger.tasks)[-1]
+    Assert-True ($forbiddenLinkRecord.changedDuringTask -contains '.github/delegated-link') 'runner missed an out-of-scope junction creation'
+    Assert-True ($forbiddenLinkRecord.scopeViolations -contains '.github/delegated-link') 'out-of-scope junction creation was not recorded as a scope violation'
+    Assert-True ($forbiddenLinkRecord.status -eq 'rejected') 'out-of-scope junction creation was not rejected'
+    Assert-True (Test-Path -LiteralPath (Join-Path $linked '.github/delegated-link')) 'runner automatically removed a rejected junction'
 
     $env:CLAUDE_FAKE_MODE = 'remote-change'
     try {

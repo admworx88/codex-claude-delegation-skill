@@ -15,15 +15,128 @@ function Invoke-Git([string]$Path, [string[]]$Arguments) {
     return ($output -join [Environment]::NewLine).Trim()
 }
 
+function Resolve-LinkTargetPath([string]$Candidate, [string]$Target) {
+    if (-not [System.IO.Path]::IsPathRooted($Candidate)) {
+        throw "Path link candidate must be absolute: $Candidate"
+    }
+    if ([System.IO.Path]::IsPathRooted($Target)) {
+        return [System.IO.Path]::GetFullPath($Target)
+    }
+
+    $parent = [System.IO.Path]::GetDirectoryName($Candidate)
+    if ([string]::IsNullOrEmpty($parent)) {
+        $parent = [System.IO.Path]::GetPathRoot($Candidate)
+    }
+    if ([string]::IsNullOrEmpty($parent)) {
+        throw "Path link candidate does not have a resolvable parent: $Candidate"
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $parent $Target))
+}
+
+function Remove-TrailingPathSeparatorsExceptRoot([string]$Path) {
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    if ([string]::IsNullOrEmpty($root)) { throw "Path must be absolute: $Path" }
+    $trimmedPath = $Path.TrimEnd('\', '/')
+    $trimmedRoot = $root.TrimEnd('\', '/')
+    if ([string]::Equals($trimmedPath, $trimmedRoot, [System.StringComparison]::Ordinal)) {
+        return $Path
+    }
+    return $trimmedPath
+}
+
+function Resolve-CanonicalExistingPathInternal([string]$Path, [int]$LinkDepth) {
+    if ($LinkDepth -gt 64) { throw "Path contains too many link indirections: $Path" }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrEmpty($root)) { throw "Path must be absolute: $Path" }
+    $components = $fullPath.Substring($root.Length).Split(
+        [char[]]@(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        ),
+        [System.StringSplitOptions]::RemoveEmptyEntries
+    )
+    $current = $root
+    foreach ($component in $components) {
+        $candidate = Join-Path $current $component
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        $linkTypeProperty = $item.PSObject.Properties['LinkType']
+        $linkType = if ($null -eq $linkTypeProperty) { '' } else { [string]$linkTypeProperty.Value }
+        if ($linkType -notin @('SymbolicLink', 'Junction')) {
+            $current = $item.FullName
+            continue
+        }
+
+        $targets = @($item.Target)
+        if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) {
+            throw "Path link does not have exactly one resolvable target: $candidate"
+        }
+        $target = [string]$targets[0]
+        $targetPath = Resolve-LinkTargetPath -Candidate $candidate -Target $target
+        $current = Resolve-CanonicalExistingPathInternal -Path $targetPath -LinkDepth ($LinkDepth + 1)
+    }
+    return Remove-TrailingPathSeparatorsExceptRoot $current
+}
+
 function Resolve-AbsolutePath([string]$Path) {
     if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
-    return (Get-Item -LiteralPath (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path -Force -ErrorAction Stop).FullName.TrimEnd('\', '/')
+    return Resolve-CanonicalExistingPathInternal -Path $Path -LinkDepth 0
+}
+
+function Resolve-PathIdentity([string]$Path) {
+    if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
+    if (Test-Path -LiteralPath $Path) { return Resolve-AbsolutePath $Path }
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ($fullPath -eq $root) { return $root }
+    return $fullPath.TrimEnd('\', '/')
+}
+
+function Get-DelegationPlatform() {
+    if ($env:OS -eq 'Windows_NT' -or [Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+        return 'Windows'
+    }
+    if ($PSVersionTable.PSVersion.Major -ge 7 -and
+        [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) {
+        return 'MacOS'
+    }
+    throw 'Claude delegation supports only Windows and macOS hosts.'
+}
+
+function Get-PathStringComparison([string]$Platform) {
+    switch ($Platform) {
+        'Windows' { return [System.StringComparison]::OrdinalIgnoreCase }
+        'MacOS' { return [System.StringComparison]::Ordinal }
+        default { throw "Unsupported delegation platform: $Platform" }
+    }
+}
+
+function Test-CanonicalPathEqual([string]$Left, [string]$Right, [string]$Platform) {
+    return [string]::Equals($Left, $Right, (Get-PathStringComparison -Platform $Platform))
+}
+
+function New-PathIdentityMap([string]$Platform) {
+    $comparison = Get-PathStringComparison -Platform $Platform
+    $comparer = if ($comparison -eq [System.StringComparison]::OrdinalIgnoreCase) {
+        [System.StringComparer]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparer]::Ordinal
+    }
+    return [System.Collections.Hashtable]::new($comparer)
+}
+
+function Get-PathIdentityKeyUnion([hashtable]$Before, [hashtable]$After, [string]$Platform) {
+    $keys = New-PathIdentityMap -Platform $Platform
+    foreach ($key in @($Before.Keys) + @($After.Keys)) { $keys[$key] = $true }
+    return @($keys.Keys | Sort-Object)
 }
 
 function Get-WorktreeContext([string]$WorktreePath) {
     $resolved = Resolve-AbsolutePath $WorktreePath
+    $prefix = Invoke-Git $resolved @('rev-parse', '--show-prefix')
     $topLevel = Resolve-AbsolutePath (Invoke-Git $resolved @('rev-parse', '--show-toplevel'))
-    if (-not $resolved.Equals($topLevel, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not [string]::IsNullOrEmpty($prefix)) {
         throw "WorktreePath must be the linked worktree root: $topLevel"
     }
     $gitDir = Resolve-AbsolutePath (Invoke-Git $topLevel @('rev-parse', '--absolute-git-dir'))
@@ -44,7 +157,9 @@ function Get-WorktreeContext([string]$WorktreePath) {
 }
 
 function Assert-LinkedWorktree($Context) {
-    if ($Context.gitDir -eq $Context.commonDir) { throw 'Delegation requires a linked Git worktree.' }
+    if (Test-CanonicalPathEqual -Left $Context.gitDir -Right $Context.commonDir -Platform (Get-DelegationPlatform)) {
+        throw 'Delegation requires a linked Git worktree.'
+    }
     if ([string]::IsNullOrWhiteSpace($Context.branch)) { throw 'Detached HEAD is not allowed.' }
 }
 
@@ -98,14 +213,17 @@ function Read-AndAssertHandoffLedger([string]$LedgerPath, $Context, $Task) {
         @($names | Where-Object { $required -notcontains $_ }).Count -gt 0) {
         throw 'Handoff ledger has an invalid shape.'
     }
-    if ($ledger.version -isnot [int] -or $ledger.version -ne 1) { throw 'Unsupported handoff ledger version.' }
-    if (-not (Test-NonEmptyString $ledger.repositoryId) -or
-        -not ([string]$ledger.repositoryId).Equals($Context.repositoryId, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not (Test-SupportedLedgerVersion $ledger.version)) { throw 'Unsupported handoff ledger version.' }
+    if (-not (Test-NonEmptyString $ledger.repositoryId)) {
+        throw 'Handoff ledger repository identity does not match the linked worktree.'
+    }
+    $ledgerRepository = Resolve-AbsolutePath ([string]$ledger.repositoryId)
+    if (-not (Test-CanonicalPathEqual -Left $ledgerRepository -Right $Context.repositoryId -Platform (Get-DelegationPlatform))) {
         throw 'Handoff ledger repository identity does not match the linked worktree.'
     }
     if (-not (Test-NonEmptyString $ledger.worktreePath)) { throw 'Handoff ledger worktreePath is invalid.' }
     $ledgerWorktree = Resolve-AbsolutePath ([string]$ledger.worktreePath)
-    if (-not $ledgerWorktree.Equals($Context.worktreePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (-not (Test-CanonicalPathEqual -Left $ledgerWorktree -Right $Context.worktreePath -Platform (Get-DelegationPlatform))) {
         throw 'Handoff ledger worktree identity does not match the linked worktree.'
     }
     if (-not (Test-NonEmptyString $ledger.baseBranch) -or [string]$ledger.baseBranch -cne [string]$Task.baseBranch) {
@@ -179,6 +297,10 @@ function Test-PositiveInteger($Value) {
                  $Value -is [int32] -or $Value -is [uint32] -or
                  $Value -is [int64] -or $Value -is [uint64]
     return $isInteger -and $Value -gt 0
+}
+
+function Test-SupportedLedgerVersion($Value) {
+    return (Test-PositiveInteger $Value) -and [uint64]$Value -eq 1
 }
 
 function Test-NonNegativeNumber($Value) {
@@ -393,7 +515,49 @@ function Test-ClaudeAuthenticated([string]$Command) {
     }
 }
 
-function Show-OwnerSetup([string]$Worktree, [bool]$Installed) {
+function ConvertTo-PosixSingleQuotedString([string]$Value) {
+    return "'" + $Value.Replace("'", "'`"`"'`"`"'") + "'"
+}
+
+function New-MacOwnerSetupScriptContent([string]$Worktree, [bool]$Installed) {
+    $quotedWorktree = ConvertTo-PosixSingleQuotedString $Worktree
+    if ($Installed) {
+        return @"
+#!/bin/zsh
+cd -- $quotedWorktree
+printf '%s\n' 'Claude Code needs owner authentication. Claude will start now; enter /login and complete authentication.'
+if command -v claude >/dev/null 2>&1; then
+  claude
+else
+  printf '%s\n' 'Claude Code CLI is no longer available. Install it in this Terminal, then run claude and enter /login.'
+fi
+printf '%s\n' 'Interactive login shell ready. Close this Terminal window when finished.'
+exec "`${SHELL:-/bin/zsh}" -l
+"@
+    }
+    return @"
+#!/bin/zsh
+cd -- $quotedWorktree
+printf '%s\n' 'Claude Code CLI is not installed. Install Claude Code in this Terminal, then run claude and enter /login.'
+printf '%s\n' 'Installation help: https://code.claude.com/docs/en/setup'
+printf '%s\n' 'Interactive login shell ready. Install and authenticate here, then close this Terminal window.'
+exec "`${SHELL:-/bin/zsh}" -l
+"@
+}
+
+function New-OwnerSetupLaunchSpec(
+    [string]$Worktree,
+    [string]$StateDirectory,
+    [bool]$Installed,
+    [string]$Platform
+) {
+    $expectedStateDirectory = Join-Path $Worktree '.codex/claude-handoff'
+    $stateDirectoryIdentity = Resolve-PathIdentity $StateDirectory
+    $expectedStateDirectoryIdentity = Resolve-PathIdentity $expectedStateDirectory
+    if (-not (Test-CanonicalPathEqual -Left $stateDirectoryIdentity -Right $expectedStateDirectoryIdentity -Platform $Platform)) {
+        throw 'Owner setup state directory must be the canonical .codex/claude-handoff directory.'
+    }
+
     $message = if ($Installed) {
         "Claude Code needs owner authentication. Complete the login here; this window stays open at an interactive PowerShell prompt afterward. Close it when finished."
     } else {
@@ -406,7 +570,173 @@ function Show-OwnerSetup([string]$Worktree, [bool]$Installed) {
     } else {
         "Set-Location -LiteralPath '$escapedWorktree'; Write-Host '$escaped' -ForegroundColor Yellow; Read-Host 'Press Enter to reach the interactive PowerShell prompt' | Out-Null; Write-Host 'Interactive PowerShell prompt ready. Install Claude Code and authenticate here, then close this window.' -ForegroundColor Yellow"
     }
-    Start-Process powershell -ArgumentList @('-NoExit', '-NoProfile', '-Command', $command) -WorkingDirectory $Worktree | Out-Null
+
+    switch ($Platform) {
+        'Windows' {
+            return [pscustomobject]@{
+                FilePath = 'powershell'
+                ArgumentList = [object[]]@('-NoExit', '-NoProfile', '-Command', $command)
+                WorkingDirectory = $Worktree
+                ScriptPath = $null
+                ScriptContent = $null
+            }
+        }
+        'MacOS' {
+            $scriptPath = Join-Path $StateDirectory (
+                'claude-owner-setup-' + [guid]::NewGuid().ToString('N') + '.command'
+            )
+            return [pscustomobject]@{
+                FilePath = 'open'
+                ArgumentList = [object[]]@('-a', 'Terminal', $scriptPath)
+                WorkingDirectory = $Worktree
+                StateDirectory = $StateDirectory
+                ScriptPath = $scriptPath
+                ScriptContent = New-MacOwnerSetupScriptContent -Worktree $Worktree -Installed $Installed
+            }
+        }
+        default {
+            throw "Unsupported delegation platform: $Platform"
+        }
+    }
+}
+
+function Invoke-OwnerSetupLaunchSpec($LaunchSpec, [string]$Platform) {
+    switch ($Platform) {
+        'Windows' {
+            Start-Process -FilePath $LaunchSpec.FilePath -ArgumentList $LaunchSpec.ArgumentList `
+                -WorkingDirectory $LaunchSpec.WorkingDirectory | Out-Null
+            return
+        }
+        'MacOS' {
+            if ($PSVersionTable.PSVersion.Major -lt 7 -or
+                $null -eq [System.Diagnostics.ProcessStartInfo].GetProperty('ArgumentList')) {
+                throw 'macOS owner setup requires PowerShell 7 ProcessStartInfo.ArgumentList support.'
+            }
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = $LaunchSpec.FilePath
+            $startInfo.WorkingDirectory = $LaunchSpec.WorkingDirectory
+            $startInfo.UseShellExecute = $false
+            foreach ($argument in @($LaunchSpec.ArgumentList)) {
+                [void]$startInfo.ArgumentList.Add([string]$argument)
+            }
+            if ($null -ne $LaunchSpec.PSObject.Properties['StateDirectory']) {
+                Assert-OwnerSetupScriptLeafIdentity -ScriptPath $LaunchSpec.ScriptPath `
+                    -StateDirectory $LaunchSpec.StateDirectory -Platform $Platform | Out-Null
+            }
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            try {
+                if (-not $process.Start()) {
+                    throw "Failed to launch owner setup: $($LaunchSpec.FilePath)"
+                }
+                return $process
+            } catch {
+                $process.Dispose()
+                throw
+            }
+        }
+        default {
+            throw "Unsupported delegation platform: $Platform"
+        }
+    }
+}
+
+function Assert-SafeOwnerSetupScriptPath(
+    [string]$ScriptPath,
+    [string]$StateDirectory,
+    [string]$Platform
+) {
+    $stateIdentity = Resolve-AbsolutePath $StateDirectory
+    $fullScriptPath = [System.IO.Path]::GetFullPath($ScriptPath)
+    $scriptParent = [System.IO.Path]::GetDirectoryName($fullScriptPath)
+    if ([string]::IsNullOrEmpty($scriptParent)) {
+        throw 'Owner setup script path does not have a parent directory.'
+    }
+    $scriptParentIdentity = Resolve-AbsolutePath $scriptParent
+    if (-not (Test-CanonicalPathEqual -Left $scriptParentIdentity -Right $stateIdentity -Platform $Platform)) {
+        throw 'Owner setup script must be stored directly inside the handoff state directory.'
+    }
+
+    $existingLeaf = Get-Item -LiteralPath $fullScriptPath -Force -ErrorAction SilentlyContinue
+    if ($null -ne $existingLeaf) {
+        $linkTypeProperty = $existingLeaf.PSObject.Properties['LinkType']
+        $linkType = if ($null -eq $linkTypeProperty) { '' } else { [string]$linkTypeProperty.Value }
+        if (($existingLeaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $linkType -in @('SymbolicLink', 'Junction')) {
+            throw 'Owner setup script path must not be a link or reparse point.'
+        }
+    }
+
+    return Join-Path $stateIdentity ([System.IO.Path]::GetFileName($fullScriptPath))
+}
+
+function Assert-OwnerSetupScriptLeafIdentity(
+    [string]$ScriptPath,
+    [string]$StateDirectory,
+    [string]$Platform
+) {
+    $expectedPath = Assert-SafeOwnerSetupScriptPath -ScriptPath $ScriptPath `
+        -StateDirectory $StateDirectory -Platform $Platform
+    $leaf = Get-Item -LiteralPath $expectedPath -Force -ErrorAction Stop
+    $linkTypeProperty = $leaf.PSObject.Properties['LinkType']
+    $linkType = if ($null -eq $linkTypeProperty) { '' } else { [string]$linkTypeProperty.Value }
+    if (($leaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $linkType -in @('SymbolicLink', 'Junction')) {
+        throw 'Owner setup script path must not be a link or reparse point.'
+    }
+    $resolvedPath = Resolve-AbsolutePath $expectedPath
+    if (-not (Test-CanonicalPathEqual -Left $resolvedPath -Right $expectedPath -Platform $Platform)) {
+        throw 'Owner setup script escaped the handoff state directory.'
+    }
+    return $resolvedPath
+}
+
+function Set-OwnerSetupScriptMode([string]$ScriptPath) {
+    & chmod 700 $ScriptPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to secure owner setup script: $ScriptPath"
+    }
+}
+
+function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Installed) {
+    $platform = Get-DelegationPlatform
+    $launchSpec = New-OwnerSetupLaunchSpec -Worktree $Worktree -StateDirectory $StateDirectory `
+        -Installed $Installed -Platform $platform
+    if ($platform -eq 'MacOS') {
+        $safeScriptPath = Assert-SafeOwnerSetupScriptPath -ScriptPath $launchSpec.ScriptPath `
+            -StateDirectory $StateDirectory -Platform $platform
+        $scriptStream = [System.IO.FileStream]::new(
+            $safeScriptPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $scriptWriter = [System.IO.StreamWriter]::new(
+                $scriptStream,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            try {
+                $scriptWriter.Write($launchSpec.ScriptContent)
+                $scriptWriter.Flush()
+            } finally {
+                $scriptWriter.Dispose()
+            }
+        } finally {
+            $scriptStream.Dispose()
+        }
+        $securedScriptPath = Assert-OwnerSetupScriptLeafIdentity -ScriptPath $safeScriptPath `
+            -StateDirectory $StateDirectory -Platform $platform
+        Set-OwnerSetupScriptMode -ScriptPath $securedScriptPath
+        $securedScriptPath = Assert-OwnerSetupScriptLeafIdentity -ScriptPath $securedScriptPath `
+            -StateDirectory $StateDirectory -Platform $platform
+        $launchSpec.ScriptPath = $securedScriptPath
+        $launchSpec.ArgumentList = [object[]]@('-a', 'Terminal', $securedScriptPath)
+    }
+    $launchProcess = Invoke-OwnerSetupLaunchSpec -LaunchSpec $launchSpec -Platform $platform
+    if ($null -ne $launchProcess) {
+        $launchProcess.Dispose()
+    }
 }
 
 function Set-OwnerWaitState([string]$LedgerPath, $Task, [string]$Reason) {
@@ -447,8 +777,35 @@ function Exit-TaskLock($LockHandle) {
     if ($null -ne $LockHandle) { $LockHandle.Dispose() }
 }
 
+function Get-ReparseEntryFingerprint([System.IO.FileSystemInfo]$Entry) {
+    $linkTypeProperty = $Entry.PSObject.Properties['LinkType']
+    $linkType = if ($null -eq $linkTypeProperty -or
+        [string]::IsNullOrWhiteSpace([string]$linkTypeProperty.Value)) {
+        'ReparsePoint'
+    } else {
+        [string]$linkTypeProperty.Value
+    }
+    $targetProperty = $Entry.PSObject.Properties['Target']
+    $targets = if ($null -eq $targetProperty) {
+        [string[]]@()
+    } else {
+        [string[]]@($targetProperty.Value | ForEach-Object { [string]$_ })
+    }
+    [Array]::Sort($targets, [System.StringComparer]::Ordinal)
+    $entryKind = if (($Entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+        'directory'
+    } else {
+        'file'
+    }
+    return ([ordered]@{
+        entryKind = $entryKind
+        linkType = $linkType
+        targets = $targets
+    } | ConvertTo-Json -Compress)
+}
+
 function Get-WorktreeFingerprint([string]$Worktree) {
-    $map = @{}
+    $map = New-PathIdentityMap -Platform (Get-DelegationPlatform)
     $root = Get-Item -LiteralPath $Worktree -ErrorAction Stop
     $rootPrefixLength = $root.FullName.TrimEnd('\', '/').Length + 1
     $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
@@ -457,16 +814,26 @@ function Get-WorktreeFingerprint([string]$Worktree) {
         $directory = $pending.Pop()
         foreach ($file in $directory.GetFiles()) {
             $relative = $file.FullName.Substring($rootPrefixLength).Replace('\', '/')
-            if ($relative -eq '.git' -or $relative.StartsWith('.codex/claude-handoff/', [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ((Test-CanonicalPathEqual -Left $relative -Right '.git' -Platform (Get-DelegationPlatform)) -or
+                $relative.StartsWith('.codex/claude-handoff/', (Get-PathStringComparison (Get-DelegationPlatform)))) {
                 continue
             }
-            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $map[$relative] = Get-ReparseEntryFingerprint -Entry $file
+                continue
+            }
             $map[$relative] = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash
         }
         foreach ($child in $directory.GetDirectories()) {
             $relative = $child.FullName.Substring($rootPrefixLength).Replace('\', '/')
-            if ($relative -eq '.git' -or $relative -eq '.codex/claude-handoff') { continue }
-            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if ((Test-CanonicalPathEqual -Left $relative -Right '.git' -Platform (Get-DelegationPlatform)) -or
+                (Test-CanonicalPathEqual -Left $relative -Right '.codex/claude-handoff' -Platform (Get-DelegationPlatform))) {
+                continue
+            }
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $map[$relative] = Get-ReparseEntryFingerprint -Entry $child
+                continue
+            }
             $pending.Push($child)
         }
     }
@@ -474,8 +841,8 @@ function Get-WorktreeFingerprint([string]$Worktree) {
 }
 
 function Compare-WorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
-    $all = @($Before.Keys) + @($After.Keys) | Sort-Object -Unique
-    return @($all | Where-Object { $Before[$_] -ne $After[$_] })
+    $all = Get-PathIdentityKeyUnion -Before $Before -After $After -Platform (Get-DelegationPlatform)
+    return @($all | Where-Object { $Before[$_] -cne $After[$_] })
 }
 
 function Get-FileIdentity([string]$Path) {
@@ -488,19 +855,19 @@ function ConvertTo-StableFingerprint([hashtable]$Fingerprint) {
 }
 
 function Get-SiblingWorktreeFingerprint($Context) {
-    $siblings = @{}
+    $siblings = New-PathIdentityMap -Platform (Get-DelegationPlatform)
     $worktreeList = Invoke-Git $Context.worktreePath @('worktree', 'list', '--porcelain')
     foreach ($line in @($worktreeList -split "`r?`n")) {
         if (-not $line.StartsWith('worktree ')) { continue }
         $path = Resolve-AbsolutePath $line.Substring(9)
-        if ($path.Equals($Context.worktreePath, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-        $siblings[$path.ToLowerInvariant()] = ConvertTo-StableFingerprint (Get-WorktreeFingerprint -Worktree $path)
+        if (Test-CanonicalPathEqual -Left $path -Right $Context.worktreePath -Platform (Get-DelegationPlatform)) { continue }
+        $siblings[$path] = ConvertTo-StableFingerprint (Get-WorktreeFingerprint -Worktree $path)
     }
     return $siblings
 }
 
 function Compare-SiblingWorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
-    $all = @($Before.Keys) + @($After.Keys) | Sort-Object -Unique
+    $all = Get-PathIdentityKeyUnion -Before $Before -After $After -Platform (Get-DelegationPlatform)
     return @($all | Where-Object { $Before[$_] -cne $After[$_] })
 }
 
@@ -1032,8 +1399,8 @@ if (-not $LibraryMode) {
     Assert-LinkedWorktree -Context $context
     $resolvedTask = Resolve-AbsolutePath $TaskPacketPath
     $expectedStateDir = Join-Path $context.worktreePath '.codex/claude-handoff'
-    $statePrefix = $expectedStateDir.TrimEnd('\') + '\'
-    if (-not $resolvedTask.StartsWith($statePrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    $statePrefix = $expectedStateDir.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedTask.StartsWith($statePrefix, (Get-PathStringComparison (Get-DelegationPlatform)))) {
         throw 'Task packet must be stored inside .codex/claude-handoff/.'
     }
     $task = Read-TaskPacket -Path $resolvedTask
@@ -1049,13 +1416,13 @@ if (-not $LibraryMode) {
     }
     if (-not (Test-ClaudeAvailable $ClaudeCommand)) {
         Set-OwnerWaitState -LedgerPath $state.ledgerPath -Task $task -Reason 'claude-cli-missing'
-        Show-OwnerSetup -Worktree $context.worktreePath -Installed $false
+        Show-OwnerSetup -Worktree $context.worktreePath -StateDirectory $state.stateDir -Installed $false
         throw 'Claude Code setup requires owner action.'
     }
     $resolvedClaudeCommand = Resolve-ClaudeCommandPath -Command $ClaudeCommand
     if (-not (Test-ClaudeAuthenticated $resolvedClaudeCommand)) {
         Set-OwnerWaitState -LedgerPath $state.ledgerPath -Task $task -Reason 'claude-authentication-required'
-        Show-OwnerSetup -Worktree $context.worktreePath -Installed $true
+        Show-OwnerSetup -Worktree $context.worktreePath -StateDirectory $state.stateDir -Installed $true
         throw 'Claude Code authentication requires owner action.'
     }
     Invoke-Delegation -Context $context -State $state -Task $task -ClaudeCommand $resolvedClaudeCommand | ConvertTo-Json -Depth 12
