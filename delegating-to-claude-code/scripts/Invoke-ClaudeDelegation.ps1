@@ -15,9 +15,58 @@ function Invoke-Git([string]$Path, [string[]]$Arguments) {
     return ($output -join [Environment]::NewLine).Trim()
 }
 
+function Resolve-CanonicalExistingPathInternal([string]$Path, [int]$LinkDepth) {
+    if ($LinkDepth -gt 64) { throw "Path contains too many link indirections: $Path" }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrEmpty($root)) { throw "Path must be absolute: $Path" }
+    $components = $fullPath.Substring($root.Length).Split(
+        [char[]]@(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        ),
+        [System.StringSplitOptions]::RemoveEmptyEntries
+    )
+    $current = $root
+    foreach ($component in $components) {
+        $candidate = Join-Path $current $component
+        $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+        $linkTypeProperty = $item.PSObject.Properties['LinkType']
+        $linkType = if ($null -eq $linkTypeProperty) { '' } else { [string]$linkTypeProperty.Value }
+        if ($linkType -notin @('SymbolicLink', 'Junction')) {
+            $current = $item.FullName
+            continue
+        }
+
+        $targets = @($item.Target)
+        if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) {
+            throw "Path link does not have exactly one resolvable target: $candidate"
+        }
+        $target = [string]$targets[0]
+        $targetPath = if ([System.IO.Path]::IsPathRooted($target)) {
+            $target
+        } else {
+            Join-Path (Split-Path -Parent $candidate) $target
+        }
+        $current = Resolve-CanonicalExistingPathInternal -Path $targetPath -LinkDepth ($LinkDepth + 1)
+    }
+    if ($current -eq $root) { return $root }
+    return $current.TrimEnd('\', '/')
+}
+
 function Resolve-AbsolutePath([string]$Path) {
     if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
-    return (Get-Item -LiteralPath (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path -Force -ErrorAction Stop).FullName.TrimEnd('\', '/')
+    return Resolve-CanonicalExistingPathInternal -Path $Path -LinkDepth 0
+}
+
+function Resolve-PathIdentity([string]$Path) {
+    if (-not [System.IO.Path]::IsPathRooted($Path)) { throw "Path must be absolute: $Path" }
+    if (Test-Path -LiteralPath $Path) { return Resolve-AbsolutePath $Path }
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($fullPath)
+    if ($fullPath -eq $root) { return $root }
+    return $fullPath.TrimEnd('\', '/')
 }
 
 function Get-DelegationPlatform() {
@@ -141,8 +190,11 @@ function Read-AndAssertHandoffLedger([string]$LedgerPath, $Context, $Task) {
         throw 'Handoff ledger has an invalid shape.'
     }
     if ($ledger.version -isnot [int] -or $ledger.version -ne 1) { throw 'Unsupported handoff ledger version.' }
-    if (-not (Test-NonEmptyString $ledger.repositoryId) -or
-        -not (Test-CanonicalPathEqual -Left ([string]$ledger.repositoryId) -Right $Context.repositoryId -Platform (Get-DelegationPlatform))) {
+    if (-not (Test-NonEmptyString $ledger.repositoryId)) {
+        throw 'Handoff ledger repository identity does not match the linked worktree.'
+    }
+    $ledgerRepository = Resolve-AbsolutePath ([string]$ledger.repositoryId)
+    if (-not (Test-CanonicalPathEqual -Left $ledgerRepository -Right $Context.repositoryId -Platform (Get-DelegationPlatform))) {
         throw 'Handoff ledger repository identity does not match the linked worktree.'
     }
     if (-not (Test-NonEmptyString $ledger.worktreePath)) { throw 'Handoff ledger worktreePath is invalid.' }
@@ -472,7 +524,9 @@ function New-OwnerSetupLaunchSpec(
     [string]$Platform
 ) {
     $expectedStateDirectory = Join-Path $Worktree '.codex/claude-handoff'
-    if (-not (Test-CanonicalPathEqual -Left $StateDirectory -Right $expectedStateDirectory -Platform $Platform)) {
+    $stateDirectoryIdentity = Resolve-PathIdentity $StateDirectory
+    $expectedStateDirectoryIdentity = Resolve-PathIdentity $expectedStateDirectory
+    if (-not (Test-CanonicalPathEqual -Left $stateDirectoryIdentity -Right $expectedStateDirectoryIdentity -Platform $Platform)) {
         throw 'Owner setup state directory must be the canonical .codex/claude-handoff directory.'
     }
 

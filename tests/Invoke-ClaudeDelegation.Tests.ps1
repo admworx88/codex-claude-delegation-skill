@@ -48,6 +48,45 @@ Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComp
 Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
 Assert-True (-not (Test-CanonicalPathEqual -Left '/Users/delegation/Task.json' -Right '/Users/delegation/task.json' -Platform 'MacOS')) 'macOS canonical paths must compare case-sensitively'
 
+$canonicalPathFixture = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'claude-delegation-canonical-path-' + [guid]::NewGuid().ToString('N')
+)
+$canonicalPathTarget = Join-Path $canonicalPathFixture 'physical-target'
+$canonicalPathAlias = Join-Path $canonicalPathFixture 'directory-alias'
+try {
+    New-Item -ItemType Directory -Path $canonicalPathTarget -Force | Out-Null
+    $canonicalPathFile = Join-Path $canonicalPathTarget 'task.json'
+    Set-Content -LiteralPath $canonicalPathFile -Value '{}' -Encoding UTF8
+    New-Item -ItemType Junction -Path $canonicalPathAlias -Target $canonicalPathTarget | Out-Null
+
+    $resolvedPhysicalFile = Resolve-AbsolutePath $canonicalPathFile
+    $resolvedAliasFile = Resolve-AbsolutePath (Join-Path $canonicalPathAlias 'task.json')
+    Assert-True (
+        $resolvedAliasFile -eq $resolvedPhysicalFile
+    ) 'existing absolute paths must resolve parent link aliases to one filesystem identity'
+
+    $canonicalExpectedState = Join-Path $canonicalPathFixture 'expected-state'
+    New-Item -ItemType Directory -Path $canonicalExpectedState -Force | Out-Null
+    $escapedDirectoryAlias = Join-Path $canonicalExpectedState 'escaped-directory'
+    New-Item -ItemType Junction -Path $escapedDirectoryAlias -Target $canonicalPathTarget | Out-Null
+    $escapedTaskAlias = Join-Path $escapedDirectoryAlias 'task.json'
+    Assert-True (
+        (Resolve-AbsolutePath $escapedTaskAlias) -eq $resolvedPhysicalFile
+    ) 'a task packet under a linked parent must resolve outside the state directory so containment checks reject escapes'
+} finally {
+    $canonicalPathFixtureFull = [System.IO.Path]::GetFullPath($canonicalPathFixture)
+    $temporaryRoot = [System.IO.Path]::GetFullPath(
+        [System.IO.Path]::GetTempPath()
+    ).TrimEnd('\', '/')
+    Assert-True (
+        (Split-Path -Parent $canonicalPathFixtureFull).TrimEnd('\', '/') -eq $temporaryRoot -and
+        (Split-Path -Leaf $canonicalPathFixtureFull) -match '^claude-delegation-canonical-path-[0-9a-f]{32}$'
+    ) 'canonical-path fixture cleanup escaped its test-owned temporary path'
+    if (Test-Path -LiteralPath $canonicalPathFixtureFull) {
+        Remove-Item -LiteralPath $canonicalPathFixtureFull -Recurse -Force
+    }
+}
+
 $macAliasOriginalResolveAbsolutePath = ${function:Resolve-AbsolutePath}
 $macAliasOriginalInvokeGit = ${function:Invoke-Git}
 $macAliasOriginalGetDelegationPlatform = ${function:Get-DelegationPlatform}
@@ -493,6 +532,17 @@ try {
     Assert-True (@($ledger.tasks).Count -eq 0) 'new ledger tasks must be empty'
 
     $validLedgerJson = Get-Content -Raw -LiteralPath $state.ledgerPath
+    $mainRepositoryAlias = Join-Path $fixtureRoot 'main-alias'
+    $linkedWorktreeAlias = Join-Path $fixtureRoot 'feature-alias'
+    New-Item -ItemType Junction -Path $mainRepositoryAlias -Target $mainRepo | Out-Null
+    New-Item -ItemType Junction -Path $linkedWorktreeAlias -Target $linked | Out-Null
+    $aliasLedger = $validLedgerJson | ConvertFrom-Json
+    $aliasLedger.repositoryId = Join-Path $mainRepositoryAlias '.git'
+    $aliasLedger.worktreePath = $linkedWorktreeAlias
+    $aliasLedger | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $state.ledgerPath -Encoding UTF8
+    Read-AndAssertHandoffLedger -LedgerPath $state.ledgerPath -Context $linkedContext -Task $direct | Out-Null
+    Set-Content -LiteralPath $state.ledgerPath -Value $validLedgerJson -Encoding UTF8
+
     foreach ($mutation in @(
         [pscustomobject]@{ name='version'; apply={ param($x) $x.version = 2 } },
         [pscustomobject]@{ name='repository'; apply={ param($x) $x.repositoryId = 'wrong' } },

@@ -254,6 +254,38 @@ done
     $env:CLAUDE_FAKE_STDIN_CAPTURE = Join-Path $stateDirectory 'claude-stdin.txt'
     $env:DELEGATION_OPEN_CAPTURE = Join-Path $stateDirectory 'open-argv.bin'
 
+    $canonicalTaskPacketPath = Resolve-AbsolutePath $fixtureTaskPacketPath
+    if ($fixtureTaskPacketPath.StartsWith('/var/', [System.StringComparison]::Ordinal)) {
+        Assert-True (
+            $canonicalTaskPacketPath.StartsWith(
+                '/private/var/',
+                [System.StringComparison]::Ordinal
+            )
+        ) 'the macOS /var task-packet alias did not resolve to its /private/var filesystem identity'
+    }
+
+    $outsideTaskPacketPath = Join-Path $fixtureRoot 'outside-task-mac-e2e.json'
+    [System.IO.File]::WriteAllText(
+        $outsideTaskPacketPath,
+        ($taskPacket | ConvertTo-Json -Depth 12),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $escapedTaskPacketPath = Join-Path $stateDirectory 'escaped-task-mac-e2e.json'
+    New-Item -ItemType SymbolicLink -Path $escapedTaskPacketPath `
+        -Target $outsideTaskPacketPath | Out-Null
+    $escapedTaskRun = Invoke-NativeCapture -FilePath $pwsh -WorkingDirectory $repositoryRoot -Arguments @(
+        '-NoProfile',
+        '-File', $runner,
+        '-WorktreePath', $linkedWorktree,
+        '-TaskPacketPath', $escapedTaskPacketPath,
+        '-ClaudeCommand', $fakeClaude,
+        '-DryRun'
+    )
+    Assert-True ($escapedTaskRun.ExitCode -ne 0) 'task-packet symlink escaped the handoff state directory'
+    Assert-True (
+        $escapedTaskRun.StandardError -match 'Task packet must be stored inside'
+    ) 'escaped task-packet rejection did not identify the state-directory boundary'
+
     $nestedDirectory = Join-Path $linkedWorktree 'nested'
     New-Item -ItemType Directory -Path $nestedDirectory -Force | Out-Null
     $nestedRun = Invoke-NativeCapture -FilePath $pwsh -WorkingDirectory $repositoryRoot -Arguments @(
