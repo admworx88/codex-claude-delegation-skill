@@ -103,7 +103,7 @@ try {
 @echo off
 echo %~1>"%CLAUDE_CHMOD_CAPTURE%"
 echo %~2>>"%CLAUDE_CHMOD_CAPTURE%"
-echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
+if not "%~3"=="" echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
 '@ | Set-Content -LiteralPath (Join-Path $macOwnerSetupBin 'chmod.cmd') -Encoding ASCII
     $env:CLAUDE_CHMOD_CAPTURE = $macChmodCapturePath
     $env:PATH = "$macOwnerSetupBin;$macOwnerSetupSavedPath"
@@ -127,10 +127,10 @@ echo %~3>>"%CLAUDE_CHMOD_CAPTURE%"
     Assert-True (-not $hasUtf8Bom) 'macOS owner setup script must be UTF-8 without BOM'
     Assert-True (Test-Path -LiteralPath $macChmodCapturePath) 'macOS owner setup must secure the script before launching Terminal'
     $capturedMacChmodArguments = @(Get-Content -LiteralPath $macChmodCapturePath)
-    Assert-True ($capturedMacChmodArguments.Count -eq 3) "macOS owner setup chmod must receive mode, option terminator, and exact path only: $($capturedMacChmodArguments -join '|')"
+    Assert-True ($capturedMacChmodArguments.Count -eq 2) "macOS owner setup chmod must receive mode and exact path only: $($capturedMacChmodArguments -join '|')"
     Assert-True ($capturedMacChmodArguments[0] -eq '700') 'macOS owner setup chmod must set mode 700'
-    Assert-True ($capturedMacChmodArguments[1] -eq '--') 'macOS owner setup chmod must use an option terminator'
-    Assert-True ($capturedMacChmodArguments[2] -ceq $writtenMacSetupPath) 'macOS owner setup chmod must receive the exact script path without shell interpolation'
+    Assert-True ([System.IO.Path]::IsPathRooted($capturedMacChmodArguments[1])) 'macOS owner setup chmod must receive an absolute script path'
+    Assert-True ($capturedMacChmodArguments[1] -ceq $writtenMacSetupPath) 'macOS owner setup chmod must receive the exact script path without shell interpolation'
     Assert-True ($global:capturedMacOwnerSetup.Launch.FilePath -eq 'open') 'macOS owner setup execution must launch the inspected open specification'
     Assert-True ($global:capturedMacOwnerSetup.LaunchPlatform -eq 'MacOS') 'macOS owner setup must use the argv-preserving macOS launch seam'
 } finally {

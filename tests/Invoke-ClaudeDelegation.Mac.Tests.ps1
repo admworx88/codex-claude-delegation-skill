@@ -57,17 +57,23 @@ function Write-PosixExecutable([string]$Path, [string]$Content) {
         $Content.Replace("`r`n", "`n"),
         [System.Text.UTF8Encoding]::new($false)
     )
-    & chmod 700 -- $Path
+    $absolutePath = (Get-Item -LiteralPath $Path -Force -ErrorAction Stop).FullName
+    & chmod 700 $absolutePath
     if ($LASTEXITCODE -ne 0) { throw "Failed to secure test executable: $Path" }
 }
 
 function Read-NulArgumentCapture([string]$Path) {
     Assert-True (Test-Path -LiteralPath $Path -PathType Leaf) "argument capture was not written: $Path"
     $text = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($Path))
-    return [string[]]$text.Split(
+    $fields = [string[]]$text.Split(
         [char[]]@([char]0),
-        [System.StringSplitOptions]::RemoveEmptyEntries
+        [System.StringSplitOptions]::None
     )
+    Assert-True (
+        $fields.Count -ge 1 -and $fields[-1] -ceq ''
+    ) 'argument capture must end with exactly one protocol delimiter'
+    if ($fields.Count -eq 1) { return [string[]]@() }
+    return [string[]]$fields[0..($fields.Count - 2)]
 }
 
 function Assert-VerifiedFixtureRoot([string]$Path) {
@@ -364,10 +370,20 @@ done
 
     $capturedPrompt = Get-Content -Raw -LiteralPath $env:CLAUDE_FAKE_STDIN_CAPTURE
     Assert-True (
-        $capturedPrompt -match [regex]::Escape($taskPacket.goal)
-    ) 'validated task prompt did not arrive through standard input'
-    Assert-True ($capturedPrompt -match '"id":\s*"mac-e2e"') 'task packet id was missing from standard input'
+        $capturedPrompt -ceq [string]$dryInvocation.standardInput
+    ) 'captured standard input differed from the complete validated task prompt'
     $claudeArguments = Read-NulArgumentCapture $env:CLAUDE_FAKE_ARGV_CAPTURE
+    $expectedClaudeArguments = [string[]]@(
+        $dryInvocation.arguments | ForEach-Object { [string]$_ }
+    )
+    Assert-True (
+        $claudeArguments.Count -eq $expectedClaudeArguments.Count
+    ) "Claude argv count differed from the validated invocation: expected $($expectedClaudeArguments.Count), got $($claudeArguments.Count)"
+    for ($argumentIndex = 0; $argumentIndex -lt $expectedClaudeArguments.Count; $argumentIndex++) {
+        Assert-True (
+            $claudeArguments[$argumentIndex] -ceq $expectedClaudeArguments[$argumentIndex]
+        ) "Claude argv[$argumentIndex] differed from the validated invocation"
+    }
     Assert-True (
         @($claudeArguments | Where-Object {
             $_ -ceq '--dangerously-skip-permissions'

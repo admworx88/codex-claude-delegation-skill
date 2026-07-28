@@ -561,7 +561,8 @@ function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Inst
             $launchSpec.ScriptContent,
             [System.Text.UTF8Encoding]::new($false)
         )
-        & chmod 700 -- $launchSpec.ScriptPath
+        $securedScriptPath = Resolve-AbsolutePath $launchSpec.ScriptPath
+        & chmod 700 $securedScriptPath
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to secure owner setup script: $($launchSpec.ScriptPath)"
         }
