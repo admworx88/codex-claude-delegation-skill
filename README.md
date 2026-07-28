@@ -1,12 +1,13 @@
-# Codex → Claude Code Delegation Skill
+# Codex -> Claude Code Delegation Skill
 
-A Codex skill for delegating bounded coding tasks to Claude Code CLI while
-keeping Codex in charge of the complete workflow.
+A Codex skill that delegates bounded coding work to Claude Code CLI while
+keeping Codex in charge of planning, scope, review, verification, acceptance,
+and every Git operation.
 
-Codex plans the work, selects the delegation mode, defines scope, reviews the
-diff, reruns verification, accepts or rejects the result, and performs every
-commit, push, and integration step. Claude is a worker: it may edit only the
-assigned files and returns candidate changes and evidence for Codex to review.
+Codex creates or selects one linked feature worktree and sends Claude a
+guarded task packet. Claude may change only the allowed files and returns
+candidate work for Codex to review. Claude never commits, pushes, merges, or
+accepts its own output.
 
 ## Important security warning
 
@@ -16,81 +17,638 @@ A linked Git worktree isolates the feature branch and Git history from the
 main checkout. **It is not an operating-system or filesystem sandbox.** Claude
 still runs with the owner's account permissions and can reach accessible
 absolute paths outside the worktree. Use a container or virtual machine around
-the entire delegation workflow when true filesystem confinement is required.
+the complete workflow when true filesystem confinement is required.
 
-The runner adds the bypass flag only after validating a linked worktree and
-task packet. Claude is also instructed and guarded against Git operations, but
-these controls do not turn the host account into a security boundary. Never
-include secrets in task packets or the local ledger.
+The guarded runner adds the bypass flag only after validating the linked
+worktree and task packet. Never run Claude with that flag manually, never put
+credentials or secrets in a task packet, and review every candidate change
+before Codex accepts it.
 
-## Prerequisites
+## Supported systems and accounts
 
-- Windows with Windows PowerShell 5.1 (`powershell.exe`); PowerShell 7 may be
-  used to start the runner, but the visible owner-setup window uses Windows
-  PowerShell
-- Git with linked-worktree support
-- Codex with local skill support
-- [Claude Code CLI](https://code.claude.com/docs/en/installation)
-  installed and authenticated by the owner
-- A Git repository where each feature or bug can use a named feature branch
+| System | Required shell | Owner setup window |
+| --- | --- | --- |
+| Windows | Windows PowerShell 5.1 (`powershell`) | Visible Windows PowerShell window |
+| macOS | PowerShell 7 (`pwsh`) | Visible macOS Terminal window |
 
-If Claude is missing or needs authentication, the runner records
-`waiting-for-owner`, opens a visible PowerShell window, and stops. The owner
-uses that same window to install or sign in interactively, closes it when
-finished, and then asks Codex to retry. When Claude is missing, press Enter in
-the setup window to reach its interactive prompt before installing and running
-`claude auth login`. The skill does not install Claude or authenticate on the
-owner's behalf.
+Linux and other hosts are not supported by this runner.
 
-## Install
+Before installing, create or obtain:
 
-Clone or download this repository, then copy the complete
-`delegating-to-claude-code` folder into the Codex skills directory:
+- a GitHub account if you need to clone private repositories or push accepted
+  work;
+- an OpenAI account with access to Codex; and
+- an Anthropic account with access to Claude Code.
+
+The commands below use the official
+[Codex installers](https://developers.openai.com/codex/cli/),
+[Claude Code quickstart](https://code.claude.com/docs/en/quickstart),
+[Homebrew installer](https://brew.sh/), and
+[PowerShell for macOS instructions](https://learn.microsoft.com/en-us/powershell/scripting/install/alternate-install-methods?view=powershell-7.6#install-on-macos-using-homebrew).
+
+## Windows installation
+
+Use a normal PowerShell window. Run each numbered step separately so you can
+check the result before continuing.
+
+### 1. Install Git
 
 ```powershell
-$source = "<repository>\delegating-to-claude-code"
-$destination = Join-Path $HOME ".codex\skills\delegating-to-claude-code"
-Copy-Item -Recurse -Force -LiteralPath $source -Destination $destination
+winget install --id Git.Git -e
 ```
 
-Restart Codex if the skill is not discovered in the current session.
+Close and reopen PowerShell after installation, then verify:
 
-## Use
+```powershell
+git --version
+```
 
-Ask Codex to delegate a feature or bug fix, for example:
+Success prints a Git version such as `git version 2.x`.
 
-> Use the delegating-to-claude-code skill. Keep Codex as orchestrator and
-> delegate implementation of the CSV export bug to Claude Code.
+### 2. Install and sign in to Codex
 
-Codex creates or selects one linked feature worktree and keeps all top-level
-Claude tasks for that feature sequential in that same worktree. Claude never
-commits, pushes, merges, accepts its own output, or integrates changes. Codex
-independently reviews and verifies each candidate before accepting it.
+```powershell
+irm https://chatgpt.com/codex/install.ps1 | iex
+codex --version
+codex login
+codex login status
+```
 
-### Delegation modes
+Complete the browser sign-in opened by `codex login`. Success is confirmed
+when `codex --version` prints a version and `codex login status` reports an
+authenticated session.
 
-| Mode | Intended use |
-| --- | --- |
-| `direct` | A small change or tightly coupled work performed by the primary Claude session. |
-| `subagents` | A medium task with a few bounded, independent subtasks coordinated inside one top-level Claude invocation. |
-| `agent-team` | A long task with at least two independent, non-overlapping workstreams and exclusive path ownership. This mode is experimental and uses a fresh team-scoped session. |
+### 3. Install and sign in to Claude Code
 
-Codex alone chooses the mode. Duration by itself does not justify parallelism;
-dependent or overlapping work remains sequential.
+```powershell
+irm https://claude.ai/install.ps1 | iex
+claude --version
+claude
+```
 
-## Worktree and local ledger
+The first `claude` session guides you through browser authentication. Complete
+the prompts, then exit the Claude session when it is ready. `claude --version`
+must print a version before continuing.
 
-The guarded runner refuses the repository's main checkout, requires the exact
-canonical linked-worktree root, and validates repository/worktree identity,
-base and feature branches, the ledger, and the task packet before dry-run or
-launch. It prevents concurrent top-level tasks and compares sibling worktrees,
-the Git index, all refs, repository/worktree configuration, HEAD, branch,
-remotes, file changes, and forbidden paths after execution.
+### 4. Clone this repository
 
-Task packets use normalized relative paths, positive turn/time/budget limits,
-the complete Git prohibition set, and explicit secret/credential
-prohibitions. Agent teams are limited to three workstreams unless the packet
-explicitly justifies a larger bounded team.
+The following command places the public repository directly under your home
+folder:
+
+```powershell
+$repo = Join-Path $HOME 'codex-claude-delegation-skill'
+git clone https://github.com/admworx88/codex-claude-delegation-skill.git $repo
+Set-Location $repo
+```
+
+If Git says the destination already exists, do not overwrite it. Use the
+update procedure later in this README.
+
+### 5. Install the complete skill folder
+
+This first-install command deliberately stops if a copy is already installed:
+
+```powershell
+$skillsRoot = Join-Path $HOME '.agents\skills'
+$source = Join-Path $repo 'delegating-to-claude-code'
+$destination = Join-Path $skillsRoot 'delegating-to-claude-code'
+
+New-Item -ItemType Directory -Force -Path $skillsRoot | Out-Null
+if (Test-Path -LiteralPath $destination) {
+    throw "Skill already exists at $destination. Use the update procedure instead."
+}
+Copy-Item -Recurse -LiteralPath $source -Destination $destination
+```
+
+Verify both the skill instructions and guarded runner:
+
+```powershell
+Test-Path (Join-Path $destination 'SKILL.md')
+Test-Path (Join-Path $destination 'scripts\Invoke-ClaudeDelegation.ps1')
+```
+
+Success prints `True` twice.
+
+### 6. Restart Codex
+
+Close every running Codex CLI session and start a new one after installation.
+The new session discovers user skills from:
+
+```text
+~/.agents/skills/delegating-to-claude-code
+```
+
+## macOS installation
+
+Open the Terminal application. The commands in this section are shell commands
+unless a step explicitly says to type inside Codex.
+
+### 1. Install Apple command-line tools and Git
+
+```bash
+xcode-select --install
+```
+
+Accept the macOS installer prompt. When it finishes, verify:
+
+```bash
+git --version
+```
+
+Success prints a Git version. If the command-line tools were already
+installed, macOS may say so; the version check is the deciding signal.
+
+### 2. Install Homebrew if needed
+
+Check first:
+
+```bash
+brew --version
+```
+
+If that prints `command not found`, use the current command from the official
+[Homebrew installation page](https://brew.sh/):
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+At the end, Homebrew may print a `Next steps` command that adds Homebrew to
+your shell environment. Run the command it prints, open a new Terminal window,
+and verify:
+
+```bash
+brew --version
+```
+
+### 3. Install PowerShell 7
+
+```bash
+brew install powershell
+pwsh --version
+```
+
+Success prints `PowerShell 7.x`. The macOS runner requires `pwsh`; it does not
+fall back to Windows PowerShell.
+
+### 4. Install and sign in to Codex
+
+```bash
+curl -fsSL https://chatgpt.com/codex/install.sh | sh
+codex --version
+codex login
+codex login status
+```
+
+Complete the browser sign-in opened by `codex login`. Success is confirmed
+when `codex --version` prints a version and `codex login status` reports an
+authenticated session.
+
+### 5. Install and sign in to Claude Code
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+claude --version
+claude
+```
+
+Complete the first-run browser authentication, then exit the Claude session
+when it is ready. `claude --version` must print a version before continuing.
+
+### 6. Clone this repository
+
+```bash
+repo="$HOME/codex-claude-delegation-skill"
+git clone https://github.com/admworx88/codex-claude-delegation-skill.git "$repo"
+cd "$repo"
+```
+
+If Git says the destination already exists, do not overwrite it. Use the
+update procedure later in this README.
+
+### 7. Install the complete skill folder
+
+This first-install command stops if a copy is already installed:
+
+```bash
+skills_root="$HOME/.agents/skills"
+source_dir="$repo/delegating-to-claude-code"
+destination="$skills_root/delegating-to-claude-code"
+
+mkdir -p "$skills_root"
+if [ -e "$destination" ]; then
+  echo "Skill already exists at $destination. Use the update procedure instead."
+else
+  cp -R "$source_dir" "$destination"
+fi
+```
+
+Verify both required files:
+
+```bash
+test -f "$destination/SKILL.md" && echo "SKILL.md found"
+test -f "$destination/scripts/Invoke-ClaudeDelegation.ps1" && echo "Runner found"
+```
+
+Success prints both `SKILL.md found` and `Runner found`.
+
+### 8. Restart Codex
+
+Close every running Codex CLI session and start a new one. Codex discovers the
+skill from:
+
+```text
+~/.agents/skills/delegating-to-claude-code
+```
+
+## First use
+
+### 1. Open the project you want to change
+
+On Windows, run in PowerShell:
+
+```powershell
+Set-Location 'C:\path\to\your-git-repository'
+git status
+codex
+```
+
+On macOS, run in Terminal:
+
+```bash
+cd "/path/to/your-git-repository"
+git status
+codex
+```
+
+Replace the example path with the real path. `git status` must recognize a Git
+repository. The final command starts the interactive Codex prompt.
+
+### 2. Invoke the skill inside Codex
+
+The next block is **not a shell command**. Paste it into the interactive Codex
+prompt that appeared after you ran `codex`:
+
+```text
+$delegating-to-claude-code
+
+Fix the CSV export bug. Keep Codex as orchestrator. Let Codex choose the
+delegation mode, independently verify Claude's work, and perform all Git
+operations only after acceptance.
+```
+
+Using the `$delegating-to-claude-code` name explicitly asks Codex to load this
+skill. Codex should then:
+
+1. plan the bounded task;
+2. create or select one named linked feature worktree;
+3. add `.codex/claude-handoff/` to that worktree's `.gitignore`;
+4. write a local task packet and ledger;
+5. dry-run and execute the guarded Claude invocation;
+6. receive a `needs-review` candidate result;
+7. inspect the complete diff and independently rerun verification;
+8. accept, request a bounded revision, or reject the candidate; and
+9. perform commits, pushes, or integration only after acceptance and owner
+   direction.
+
+All top-level delegations for the same feature run sequentially in that one
+linked worktree. Claude may use internal subagents or an experimental agent
+team only when Codex determines the task structure supports it.
+
+## Complete prompt examples
+
+Paste one of these examples **inside an interactive Codex session**, not into
+PowerShell or Terminal.
+
+### Small, tightly coupled task: direct
+
+```text
+$delegating-to-claude-code
+
+Fix the off-by-one error in the invoice CSV page count and add its focused
+regression test. This is a small, tightly coupled change, so use direct mode
+if preflight confirms it is appropriate. Keep Claude inside the explicitly
+allowed source and test files. Codex must review the diff, rerun the test, and
+own every Git operation.
+```
+
+### Medium task: Claude subagents
+
+```text
+$delegating-to-claude-code
+
+Implement validation for the profile import flow. Ask Codex to consider
+subagents because investigation, implementation, and focused test analysis can
+be bounded independently inside one top-level Claude invocation. Keep one
+linked feature worktree and one consolidated result. Codex must independently
+review and verify all candidate changes before acceptance.
+```
+
+### Long independent workstreams: experimental agent team
+
+```text
+$delegating-to-claude-code
+
+Complete the long provider-adapter migration. Ask Codex to consider the experimental
+agent-team mode only if these workstreams are truly independent:
+
+- Workstream A exclusively owns packages/github-adapter/**
+- Workstream B exclusively owns packages/gitlab-adapter/**
+
+Do not overlap owned paths or allow teammates to edit shared configuration.
+Use one linked feature worktree and one top-level Claude invocation. Codex must
+review the combined diff, rerun all required verification, and retain sole
+ownership of commits, pushes, and integration.
+```
+
+Agent-team mode is experimental. Codex should choose direct or subagents when
+work is dependent, ownership overlaps, or the task is not large enough to
+justify a bounded team. Duration alone is not a reason to run work in parallel.
+
+## What happens when installation or login is missing
+
+The runner never performs silent installation or authentication.
+
+If Claude is missing or unauthenticated, the runner first records
+`waiting-for-owner`, opens a visible setup window, and stops the delegation:
+
+- Windows opens a Windows PowerShell window. Follow its message to install
+  Claude if needed or complete `claude auth login`.
+- macOS opens Terminal. Install Claude if needed, then run `claude`, enter
+  `/login` when instructed, and complete the browser flow.
+
+No setup window receives `--dangerously-skip-permissions`. Close the setup
+window after authentication, return to Codex, and ask it to rerun the same
+guarded packet. The owner always performs account authentication manually.
+
+## Update the skill
+
+These procedures make a timestamped backup before replacing the installed
+copy. Finish any active delegation first, then close Codex.
+
+### Windows update
+
+Run in PowerShell:
+
+```powershell
+$repo = Join-Path $HOME 'codex-claude-delegation-skill'
+$source = Join-Path $repo 'delegating-to-claude-code'
+$destination = Join-Path $HOME '.agents\skills\delegating-to-claude-code'
+$backupRoot = Join-Path $HOME '.agents\skill-backups'
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$backup = Join-Path $backupRoot "delegating-to-claude-code-$stamp"
+
+Set-Location $repo
+git pull --ff-only
+if (-not (Test-Path -LiteralPath $destination)) {
+    throw "Installed skill not found at $destination"
+}
+New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+Move-Item -LiteralPath $destination -Destination $backup
+Copy-Item -Recurse -LiteralPath $source -Destination $destination
+Test-Path (Join-Path $destination 'SKILL.md')
+```
+
+Success prints `True`. Your previous installation is preserved at the path in
+`$backup`. Restart Codex after the update.
+
+### macOS update
+
+Run in Terminal:
+
+```bash
+repo="$HOME/codex-claude-delegation-skill"
+source_dir="$repo/delegating-to-claude-code"
+destination="$HOME/.agents/skills/delegating-to-claude-code"
+backup_root="$HOME/.agents/skill-backups"
+stamp="$(date +%Y%m%d-%H%M%S)"
+backup="$backup_root/delegating-to-claude-code-$stamp"
+
+cd "$repo"
+git pull --ff-only
+if [ ! -d "$destination" ]; then
+  echo "Installed skill not found at $destination"
+else
+  mkdir -p "$backup_root"
+  mv "$destination" "$backup"
+  cp -R "$source_dir" "$destination"
+  test -f "$destination/SKILL.md" && echo "Skill updated"
+fi
+```
+
+Success prints `Skill updated`. Your previous installation is preserved at
+the path in `$backup`. Restart Codex after the update.
+
+## Uninstall the skill
+
+Finish any active delegation and close Codex first. The following commands
+uninstall only the exact `delegating-to-claude-code` directory by moving it to
+a recoverable timestamped backup. They do not remove `.agents`, other skills,
+your repositories, or your home directory.
+
+### Windows uninstall
+
+```powershell
+$destination = Join-Path $HOME '.agents\skills\delegating-to-claude-code'
+$backupRoot = Join-Path $HOME '.agents\skill-backups'
+$removed = Join-Path $backupRoot ("delegating-to-claude-code-uninstalled-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+
+if (-not (Test-Path -LiteralPath $destination)) {
+    throw "Installed skill not found at $destination"
+}
+New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+Move-Item -LiteralPath $destination -Destination $removed
+Write-Host "Uninstalled. Recoverable copy: $removed"
+```
+
+### macOS uninstall
+
+```bash
+destination="$HOME/.agents/skills/delegating-to-claude-code"
+backup_root="$HOME/.agents/skill-backups"
+removed="$backup_root/delegating-to-claude-code-uninstalled-$(date +%Y%m%d-%H%M%S)"
+
+if [ ! -d "$destination" ]; then
+  echo "Installed skill not found at $destination"
+else
+  mkdir -p "$backup_root"
+  mv "$destination" "$removed"
+  echo "Uninstalled. Recoverable copy: $removed"
+fi
+```
+
+Restart Codex. To restore a backup, move that exact backup directory back to
+`~/.agents/skills/delegating-to-claude-code` while Codex is closed.
+
+## Troubleshooting
+
+### A command is not found
+
+Open a new PowerShell or Terminal window first; installers often update PATH
+for new sessions.
+
+On Windows:
+
+```powershell
+Get-Command git
+Get-Command powershell
+Get-Command codex
+Get-Command claude
+```
+
+Each command should print an application path. Re-run only the official
+installer for the missing command. If `winget` itself is missing, install Git
+from [git-scm.com](https://git-scm.com/download/win).
+
+On macOS:
+
+```bash
+command -v git
+command -v brew
+command -v pwsh
+command -v codex
+command -v claude
+```
+
+Each command should print a path. If `brew` is missing after installation, run
+the `Next steps` shell-environment command printed by Homebrew. If `pwsh` is
+missing, run `brew install powershell`. For Codex or Claude, rerun the official
+installer and follow any PATH instruction it prints.
+
+### Codex login fails or expires
+
+```text
+codex login
+codex login status
+```
+
+Run those commands in PowerShell or Terminal, not inside the Codex prompt.
+Complete the browser flow with the intended OpenAI account.
+
+### Claude login fails or expires
+
+Run `claude` in PowerShell or Terminal, then type `/login` inside the Claude
+session and complete the browser flow. On Windows, `claude auth login` is also
+the recovery command shown by the runner's visible setup window. Verify
+afterward with:
+
+```text
+claude --version
+```
+
+Return to Codex and retry the same delegation only after authentication is
+complete.
+
+### Codex cannot discover the skill
+
+Close and restart Codex, then check for the correct non-nested location.
+
+Windows:
+
+```powershell
+$destination = Join-Path $HOME '.agents\skills\delegating-to-claude-code'
+Test-Path (Join-Path $destination 'SKILL.md')
+Test-Path (Join-Path $destination 'delegating-to-claude-code\SKILL.md')
+```
+
+The first result must be `True`; the second should be `False`.
+
+macOS:
+
+```bash
+destination="$HOME/.agents/skills/delegating-to-claude-code"
+test -f "$destination/SKILL.md" && echo "Correct skill location"
+test ! -f "$destination/delegating-to-claude-code/SKILL.md" \
+  && echo "No nested duplicate"
+```
+
+Both success messages should print. If the nested file exists, back up the
+installed directory and reinstall from the repository using the exact
+destination shown above.
+
+### `pwsh` is missing on macOS
+
+```bash
+brew install powershell
+pwsh --version
+```
+
+The second command must print `PowerShell 7.x`. Do not substitute `powershell`
+or another shell for the guarded runner.
+
+### macOS does not open the owner setup Terminal
+
+Verify the built-in `open` command and Terminal application:
+
+```bash
+command -v open
+open -a Terminal
+```
+
+The first command should print `/usr/bin/open`; the second should open
+Terminal. The runner stores generated `.command` files only under the ignored
+`.codex/claude-handoff/` directory and secures them to mode `700`. If macOS
+reports a permission problem, inspect the exact generated file and repair only
+that file:
+
+```bash
+ls -l "<linked-worktree>/.codex/claude-handoff/"*.command
+chmod 700 "/absolute/path/to/generated-owner-setup.command"
+```
+
+Then return to Codex and retry. Do not apply recursive permission changes to
+the repository or home directory.
+
+### The runner rejects the checkout or worktree
+
+The runner intentionally refuses the main checkout, nested paths, mismatched
+branches, and unexpected Git state. Diagnose without deleting anything:
+
+```text
+git rev-parse --show-toplevel
+git branch --show-current
+git worktree list --porcelain
+git status
+```
+
+Ask Codex to create or select one named linked feature worktree and use its
+exact canonical root. Keep all top-level tasks for that feature sequential in
+the same worktree. Do not bypass the guard or move the task into the main
+checkout.
+
+### A delegation is rejected
+
+Rejection is a safety result, not a request to reset the repository. Preserve
+the linked worktree and `.codex/claude-handoff/` evidence. Ask Codex to inspect
+the ledger, normalized result, raw log, Git snapshots, and complete diff.
+Codex may prepare a new bounded revision packet for safe incomplete work.
+Destructive cleanup such as reset, clean, or worktree removal requires explicit
+owner approval.
+
+### Local tests or GitHub Actions fail
+
+From this repository root, run the test for the current host.
+
+Windows:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\tests\Invoke-ClaudeDelegation.Tests.ps1
+```
+
+macOS:
+
+```bash
+pwsh -NoProfile -File ./tests/Invoke-ClaudeDelegation.Mac.Tests.ps1
+```
+
+Success exits with code `0`. The tests use a deterministic fake Claude command
+and do not need live Claude credentials. GitHub Actions runs the Windows and
+macOS suites on their native hosted runners; inspect the failed job and step
+before changing the runner. Native macOS support should not be claimed from a
+Windows-only test result.
+
+## How the local ledger works
 
 Each feature keeps durable handoff state under:
 
@@ -98,30 +656,27 @@ Each feature keeps durable handoff state under:
 .codex/claude-handoff/
 ```
 
-That folder contains task packets, a ledger, locks, raw output, normalized
-results, Git-state evidence, and review decisions. It stays local and ignored
-by Git. Session continuity helps direct and subagent runs, but the ledger is
-the durable source of context.
+The folder contains task packets, `ledger.json`, the single-task lock, raw
+output, normalized results, Git-state evidence, and Codex review decisions.
+It stays local and ignored by Git. The ledger preserves task status and
+evidence across separate Claude sessions; it does not contain or transfer the
+Codex conversation automatically, so the task packet must include the bounded
+context Claude needs. Never store credentials, reusable tokens, or secrets in
+the ledger.
 
-## Validate and test
+## Trust boundary summary
 
-From the repository root. The deterministic PowerShell suite needs only the
-runtime prerequisites above. The optional skill metadata validator additionally
-requires Python 3 and
-[PyYAML](https://pyyaml.org/wiki/PyYAMLDocumentation) (`python -m pip install PyYAML`):
-
-```powershell
-python "$HOME\.codex\skills\.system\skill-creator\scripts\quick_validate.py" `
-  ".\delegating-to-claude-code"
-
-powershell -NoProfile -ExecutionPolicy Bypass `
-  -File ".\tests\Invoke-ClaudeDelegation.Tests.ps1"
-```
-
-The deterministic test suite substitutes a fake Claude executable, so it does
-not require live Claude credentials. A real smoke test is optional and should
-run only after the owner has installed and authenticated Claude.
+- Codex plans, defines scope, creates the task packet, reviews, verifies,
+  accepts or rejects, and owns every Git operation.
+- Claude may edit only task-packet `allowedPaths` and returns untrusted
+  candidate evidence.
+- The runner rejects forbidden paths, Git-state changes, sibling-worktree
+  changes, and unsafe packet or host conditions.
+- Claude never commits, pushes, pulls, merges, rebases, resets, checks out,
+  switches branches, stashes, tags, edits remotes, or creates worktrees.
+- No automatic commit or push occurs after Claude finishes. Codex acts only
+  after independent review, acceptance, and owner direction.
 
 ## License
 
-[MIT](LICENSE) © 2026 Aljon Moliva
+[MIT](LICENSE) (c) 2026 Aljon Moliva
