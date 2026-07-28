@@ -151,7 +151,7 @@ try {
 
     $stateDirectory = Join-Path $linkedWorktree '.codex/claude-handoff'
     New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
-    $taskPacketPath = Join-Path $stateDirectory 'task-mac-e2e.json'
+    $fixtureTaskPacketPath = Join-Path $stateDirectory 'task-mac-e2e.json'
     $taskPacket = [pscustomobject][ordered]@{
         id = 'SENTINEL_TASK_ID_MAC_E2E'
         goal = 'SENTINEL_GOAL_MAC_E2E'
@@ -212,12 +212,12 @@ try {
         safetyDirective = 'Do not commit, push, switch branches, modify remotes, or expand scope.'
     }
     [System.IO.File]::WriteAllText(
-        $taskPacketPath,
+        $fixtureTaskPacketPath,
         ($taskPacket | ConvertTo-Json -Depth 12),
         [System.Text.UTF8Encoding]::new($false)
     )
 
-    $validatedTask = Read-TaskPacket -Path $taskPacketPath
+    $validatedTask = Read-TaskPacket -Path $fixtureTaskPacketPath
     Assert-DelegationPolicy -Task $validatedTask
 
     $fakeClaude = Join-Path $binDirectory 'claude'
@@ -260,7 +260,7 @@ done
         '-NoProfile',
         '-File', $runner,
         '-WorktreePath', $nestedDirectory,
-        '-TaskPacketPath', $taskPacketPath,
+        '-TaskPacketPath', $fixtureTaskPacketPath,
         '-ClaudeCommand', $fakeClaude
     )
     Assert-True ($nestedRun.ExitCode -ne 0) 'nested linked-worktree path was accepted'
@@ -268,18 +268,18 @@ done
         $nestedRun.StandardError -match 'WorktreePath must be the linked worktree root'
     ) 'nested path rejection did not identify the required linked-worktree root'
 
-    $dryRun = Invoke-NativeCapture -FilePath $pwsh -WorkingDirectory $repositoryRoot -Arguments @(
+    $dryRunCapture = Invoke-NativeCapture -FilePath $pwsh -WorkingDirectory $repositoryRoot -Arguments @(
         '-NoProfile',
         '-File', $runner,
         '-WorktreePath', $linkedWorktree,
-        '-TaskPacketPath', $taskPacketPath,
+        '-TaskPacketPath', $fixtureTaskPacketPath,
         '-ClaudeCommand', $fakeClaude,
         '-DryRun'
     )
     Assert-True (
-        $dryRun.ExitCode -eq 0
-    ) "macOS dry-run failed: $($dryRun.StandardError)"
-    $dryInvocation = $dryRun.StandardOutput | ConvertFrom-Json
+        $dryRunCapture.ExitCode -eq 0
+    ) "macOS dry-run failed: $($dryRunCapture.StandardError)"
+    $dryInvocation = $dryRunCapture.StandardOutput | ConvertFrom-Json
     Assert-True (
         @($dryInvocation.arguments | Where-Object {
             $_ -ceq '--dangerously-skip-permissions'
@@ -346,7 +346,7 @@ done
         '-NoProfile',
         '-File', $runner,
         '-WorktreePath', $linkedWorktree,
-        '-TaskPacketPath', $taskPacketPath,
+        '-TaskPacketPath', $fixtureTaskPacketPath,
         '-ClaudeCommand', $fakeClaude
     )
     Assert-True ($run.ExitCode -eq 0) "native delegation failed: $($run.StandardError)"
