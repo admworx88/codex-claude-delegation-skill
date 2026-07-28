@@ -777,6 +777,33 @@ function Exit-TaskLock($LockHandle) {
     if ($null -ne $LockHandle) { $LockHandle.Dispose() }
 }
 
+function Get-ReparseEntryFingerprint([System.IO.FileSystemInfo]$Entry) {
+    $linkTypeProperty = $Entry.PSObject.Properties['LinkType']
+    $linkType = if ($null -eq $linkTypeProperty -or
+        [string]::IsNullOrWhiteSpace([string]$linkTypeProperty.Value)) {
+        'ReparsePoint'
+    } else {
+        [string]$linkTypeProperty.Value
+    }
+    $targetProperty = $Entry.PSObject.Properties['Target']
+    $targets = if ($null -eq $targetProperty) {
+        [string[]]@()
+    } else {
+        [string[]]@($targetProperty.Value | ForEach-Object { [string]$_ })
+    }
+    [Array]::Sort($targets, [System.StringComparer]::Ordinal)
+    $entryKind = if (($Entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+        'directory'
+    } else {
+        'file'
+    }
+    return ([ordered]@{
+        entryKind = $entryKind
+        linkType = $linkType
+        targets = $targets
+    } | ConvertTo-Json -Compress)
+}
+
 function Get-WorktreeFingerprint([string]$Worktree) {
     $map = New-PathIdentityMap -Platform (Get-DelegationPlatform)
     $root = Get-Item -LiteralPath $Worktree -ErrorAction Stop
@@ -791,7 +818,10 @@ function Get-WorktreeFingerprint([string]$Worktree) {
                 $relative.StartsWith('.codex/claude-handoff/', (Get-PathStringComparison (Get-DelegationPlatform)))) {
                 continue
             }
-            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $map[$relative] = Get-ReparseEntryFingerprint -Entry $file
+                continue
+            }
             $map[$relative] = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash
         }
         foreach ($child in $directory.GetDirectories()) {
@@ -800,7 +830,10 @@ function Get-WorktreeFingerprint([string]$Worktree) {
                 (Test-CanonicalPathEqual -Left $relative -Right '.codex/claude-handoff' -Platform (Get-DelegationPlatform))) {
                 continue
             }
-            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $map[$relative] = Get-ReparseEntryFingerprint -Entry $child
+                continue
+            }
             $pending.Push($child)
         }
     }
@@ -809,7 +842,7 @@ function Get-WorktreeFingerprint([string]$Worktree) {
 
 function Compare-WorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
     $all = Get-PathIdentityKeyUnion -Before $Before -After $After -Platform (Get-DelegationPlatform)
-    return @($all | Where-Object { $Before[$_] -ne $After[$_] })
+    return @($all | Where-Object { $Before[$_] -cne $After[$_] })
 }
 
 function Get-FileIdentity([string]$Path) {

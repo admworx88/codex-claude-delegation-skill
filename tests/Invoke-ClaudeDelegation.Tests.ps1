@@ -621,6 +621,10 @@ if "%CLAUDE_FAKE_MODE%"=="forbidden-edit" (
   if not exist "%CD%\.github\workflows" mkdir "%CD%\.github\workflows"
   echo forbidden>"%CD%\.github\workflows\ci.yml"
 )
+if "%CLAUDE_FAKE_MODE%"=="forbidden-link-create" (
+  if not exist "%CD%\.github" mkdir "%CD%\.github"
+  powershell -NoProfile -Command "New-Item -ItemType Junction -Path (Join-Path (Get-Location) '.github\delegated-link') -Target $env:CLAUDE_FAKE_LINK_TARGET | Out-Null"
+)
 if "%CLAUDE_FAKE_MODE%"=="remote-change" (
   git -C "%CD%" remote add delegation-evil https://example.invalid/evil.git
 )
@@ -1067,6 +1071,50 @@ exit /b 0
     $afterFingerprint = Get-WorktreeFingerprint -Worktree $linked
     $fingerprintChanges = Compare-WorktreeFingerprint -Before $beforeFingerprint -After $afterFingerprint
     Assert-True ($fingerprintChanges -contains 'src/parser.ps1') 'hash fingerprint missed a second change to an already dirty file'
+    $caseOnlyFingerprintChanges = Compare-WorktreeFingerprint `
+        -Before @{ 'src/link' = '{"targets":["CaseTarget"]}' } `
+        -After @{ 'src/link' = '{"targets":["casetarget"]}' }
+    Assert-True ($caseOnlyFingerprintChanges -contains 'src/link') 'fingerprint comparison ignored a case-only link target change'
+
+    $externalLinkTargetOne = Join-Path $fixtureRoot 'external-link-target-one'
+    $externalLinkTargetTwo = Join-Path $fixtureRoot 'external-link-target-two'
+    New-Item -ItemType Directory -Force -Path $externalLinkTargetOne, $externalLinkTargetTwo | Out-Null
+    Set-Content -LiteralPath (Join-Path $externalLinkTargetOne 'outside-one.txt') -Value 'outside-one'
+    Set-Content -LiteralPath (Join-Path $externalLinkTargetTwo 'outside-two.txt') -Value 'outside-two'
+    $allowedLinkPath = Join-Path $linked 'src/delegated-link'
+    $linkBeforeCreate = Get-WorktreeFingerprint -Worktree $linked
+    New-Item -ItemType Junction -Path $allowedLinkPath -Target $externalLinkTargetOne | Out-Null
+    $linkAfterCreate = Get-WorktreeFingerprint -Worktree $linked
+    $linkCreateChanges = Compare-WorktreeFingerprint -Before $linkBeforeCreate -After $linkAfterCreate
+    Assert-True ($linkCreateChanges -contains 'src/delegated-link') 'fingerprint missed a created junction entry'
+    Assert-True ($linkAfterCreate.ContainsKey('src/delegated-link')) 'fingerprint omitted a junction entry'
+    Assert-True ($linkAfterCreate['src/delegated-link'] -match '"entryKind":"directory"') 'junction fingerprint omitted its entry kind'
+    Assert-True ($linkAfterCreate['src/delegated-link'] -match '"linkType":"Junction"') 'junction fingerprint omitted its link type'
+    Assert-True ($linkAfterCreate['src/delegated-link'] -match [regex]::Escape($externalLinkTargetOne.Replace('\', '\\'))) 'junction fingerprint omitted its target'
+    Assert-True (-not $linkAfterCreate.ContainsKey('src/delegated-link/outside-one.txt')) 'fingerprint traversed an external junction target'
+    Set-Content -LiteralPath (Join-Path $externalLinkTargetOne 'outside-one.txt') -Value 'outside-one-mutated'
+    $linkAfterExternalContentChange = Get-WorktreeFingerprint -Worktree $linked
+    $externalContentChanges = Compare-WorktreeFingerprint -Before $linkAfterCreate -After $linkAfterExternalContentChange
+    Assert-True (-not ($externalContentChanges -contains 'src/delegated-link')) 'external junction target contents affected the link fingerprint'
+    $allowedLinkTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $allowedLinkTask.allowedPaths = @('src/**')
+    $allowedLinkViolations = Get-ScopeViolations -ChangedPaths $linkCreateChanges -Task $allowedLinkTask
+    Assert-True (@($allowedLinkViolations).Count -eq 0) 'allowed junction path was classified as a scope violation'
+
+    [System.IO.Directory]::Delete($allowedLinkPath)
+    New-Item -ItemType Junction -Path $allowedLinkPath -Target $externalLinkTargetTwo | Out-Null
+    $linkAfterRepoint = Get-WorktreeFingerprint -Worktree $linked
+    $linkRepointChanges = Compare-WorktreeFingerprint -Before $linkAfterCreate -After $linkAfterRepoint
+    Assert-True ($linkRepointChanges -contains 'src/delegated-link') 'fingerprint missed a repointed junction entry'
+    Assert-True ($linkAfterRepoint['src/delegated-link'] -match [regex]::Escape($externalLinkTargetTwo.Replace('\', '\\'))) 'repointed junction fingerprint omitted its new target'
+    Assert-True (-not $linkAfterRepoint.ContainsKey('src/delegated-link/outside-two.txt')) 'fingerprint traversed a repointed external junction target'
+    $forbiddenLinkViolations = Get-ScopeViolations -ChangedPaths $linkRepointChanges -Task $executionTask
+    Assert-True ($forbiddenLinkViolations -contains 'src/delegated-link') 'out-of-scope junction repoint was not classified as a scope violation'
+
+    [System.IO.Directory]::Delete($allowedLinkPath)
+    $linkAfterRemoval = Get-WorktreeFingerprint -Worktree $linked
+    $linkRemovalChanges = Compare-WorktreeFingerprint -Before $linkAfterRepoint -After $linkAfterRemoval
+    Assert-True ($linkRemovalChanges -contains 'src/delegated-link') 'fingerprint missed a removed junction entry'
 
     $env:CLAUDE_FAKE_MODE = 'allowed-edit'
     try {
@@ -1114,6 +1162,21 @@ exit /b 0
     Assert-True ($forbiddenRecord.status -eq 'rejected') 'scope violation was not rejected'
     Assert-True ($forbiddenRecord.scopeViolations -contains '.github/workflows/ci.yml') 'scope violation was not recorded'
     Assert-True (Test-Path -LiteralPath (Join-Path $linked '.github/workflows/ci.yml')) 'runner automatically reverted a rejected change'
+
+    $env:CLAUDE_FAKE_MODE = 'forbidden-link-create'
+    $env:CLAUDE_FAKE_LINK_TARGET = $externalLinkTargetOne
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+        Remove-Item Env:\CLAUDE_FAKE_LINK_TARGET -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $forbiddenLinkRecord = @($ledger.tasks)[-1]
+    Assert-True ($forbiddenLinkRecord.changedDuringTask -contains '.github/delegated-link') 'runner missed an out-of-scope junction creation'
+    Assert-True ($forbiddenLinkRecord.scopeViolations -contains '.github/delegated-link') 'out-of-scope junction creation was not recorded as a scope violation'
+    Assert-True ($forbiddenLinkRecord.status -eq 'rejected') 'out-of-scope junction creation was not rejected'
+    Assert-True (Test-Path -LiteralPath (Join-Path $linked '.github/delegated-link')) 'runner automatically removed a rejected junction'
 
     $env:CLAUDE_FAKE_MODE = 'remote-change'
     try {
