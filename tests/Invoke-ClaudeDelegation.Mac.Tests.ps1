@@ -122,7 +122,7 @@ try {
     New-Item -ItemType Directory -Path $mainRepository -Force | Out-Null
     New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
 
-    Invoke-TestGit $mainRepository @('init', '-b', 'main') | Out-Null
+    Invoke-TestGit $mainRepository @('init', '-b', 'sentinel-base-branch-mac-e2e') | Out-Null
     Invoke-TestGit $mainRepository @('config', 'user.email', 'mac-tests@example.invalid') | Out-Null
     Invoke-TestGit $mainRepository @('config', 'user.name', 'macOS Delegation Tests') | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $mainRepository 'src') -Force | Out-Null
@@ -139,20 +139,27 @@ try {
     Invoke-TestGit $mainRepository @('add', '--all') | Out-Null
     Invoke-TestGit $mainRepository @('commit', '-m', 'seed') | Out-Null
     Invoke-TestGit $mainRepository @(
-        'worktree', 'add', '-b', 'feature/mac-e2e', $linkedWorktree
+        'worktree', 'add', '-b', 'sentinel-feature-branch-mac-e2e', $linkedWorktree
     ) | Out-Null
 
     $stateDirectory = Join-Path $linkedWorktree '.codex/claude-handoff'
     New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
     $taskPacketPath = Join-Path $stateDirectory 'task-mac-e2e.json'
     $taskPacket = [pscustomobject][ordered]@{
-        id = 'mac-e2e'
-        goal = 'Make the single allowed parser edit in the native macOS fixture.'
+        id = 'SENTINEL_TASK_ID_MAC_E2E'
+        goal = 'SENTINEL_GOAL_MAC_E2E'
         mode = 'direct'
-        baseBranch = 'main'
-        featureBranch = 'feature/mac-e2e'
-        allowedPaths = @('src/**')
-        forbiddenPaths = @('.git/**', '.github/**', '.env*', 'secrets/**', 'credentials/**')
+        baseBranch = 'sentinel-base-branch-mac-e2e'
+        featureBranch = 'sentinel-feature-branch-mac-e2e'
+        allowedPaths = @('src/**', 'sentinel-allowed-path-mac-e2e/**')
+        forbiddenPaths = @(
+            '.git/**',
+            '.github/**',
+            '.env*',
+            'secrets/**',
+            'credentials/**',
+            'sentinel-forbidden-path-mac-e2e/**'
+        )
         forbiddenActions = @(
             'git commit',
             'git push',
@@ -168,16 +175,34 @@ try {
             'git remote',
             'git worktree',
             'read or expose secrets',
-            'read or expose credentials'
+            'read or expose credentials',
+            'prohibit SENTINEL_FORBIDDEN_ACTION_MAC_E2E while protecting secrets and credentials'
         )
-        context = @('Codex owns verification, acceptance, and repository history.')
-        acceptanceCriteria = @('Only src/parser.ps1 changes during delegation.')
-        requiredVerification = @('Inspect the normalized result and handoff ledger.')
+        context = @('SENTINEL_CONTEXT_MAC_E2E')
+        acceptanceCriteria = @('SENTINEL_ACCEPTANCE_CRITERION_MAC_E2E')
+        requiredVerification = @('SENTINEL_REQUIRED_VERIFICATION_MAC_E2E')
         limits = [pscustomobject][ordered]@{
             maxTurns = 2
-            timeoutSeconds = 30
+            timeoutSeconds = 37
             maxBudgetUsd = 1
         }
+    }
+    $stdinOnlySentinels = [ordered]@{
+        taskId = 'SENTINEL_TASK_ID_MAC_E2E'
+        goal = 'SENTINEL_GOAL_MAC_E2E'
+        context = 'SENTINEL_CONTEXT_MAC_E2E'
+        acceptanceCriteria = 'SENTINEL_ACCEPTANCE_CRITERION_MAC_E2E'
+        requiredVerification = 'SENTINEL_REQUIRED_VERIFICATION_MAC_E2E'
+        allowedPaths = 'sentinel-allowed-path-mac-e2e/**'
+        forbiddenPaths = 'sentinel-forbidden-path-mac-e2e/**'
+        forbiddenActions = 'SENTINEL_FORBIDDEN_ACTION_MAC_E2E'
+        baseBranch = 'sentinel-base-branch-mac-e2e'
+        featureBranch = 'sentinel-feature-branch-mac-e2e'
+        modeField = '"mode": "direct"'
+        timeoutField = '"timeoutSeconds": 37'
+        promptLabel = 'Execute the bounded task packet below.'
+        modeDirective = 'Work directly. Do not spawn subagents or teammates.'
+        safetyDirective = 'Do not commit, push, switch branches, modify remotes, or expand scope.'
     }
     [System.IO.File]::WriteAllText(
         $taskPacketPath,
@@ -205,7 +230,7 @@ for argument do
 done
 cat > "$CLAUDE_FAKE_STDIN_CAPTURE"
 printf '\ndelegated-change\n' >> './src/parser.ps1'
-printf '%s\n' '{"type":"result","session_id":"mac-fake-session","result":{"taskId":"mac-e2e","status":"completed","summary":"one allowed edit","changedFiles":["src/parser.ps1"],"tests":[{"command":"fixture verification","outcome":"passed"}],"unresolvedIssues":[],"deviations":[]}}'
+printf '%s\n' '{"type":"result","session_id":"mac-fake-session","result":{"taskId":"SENTINEL_TASK_ID_MAC_E2E","status":"completed","summary":"one allowed edit","changedFiles":["src/parser.ps1"],"tests":[{"command":"fixture verification","outcome":"passed"}],"unresolvedIssues":[],"deviations":[]}}'
 '@
 
     $fakeOpen = Join-Path $binDirectory 'open'
@@ -253,14 +278,19 @@ done
             $_ -ceq '--dangerously-skip-permissions'
         }).Count -eq 1
     ) 'validated Claude invocation must contain exactly one permission-bypass argument'
-    Assert-True (
-        $dryInvocation.standardInput -match [regex]::Escape($taskPacket.goal)
-    ) 'validated task prompt was missing from standard input'
-    Assert-True (
-        @($dryInvocation.arguments | Where-Object {
-            ([string]$_).Contains($taskPacket.goal)
-        }).Count -eq 0
-    ) 'task prompt leaked onto dry-run argv'
+    $dryArguments = [string[]]@(
+        $dryInvocation.arguments | ForEach-Object { [string]$_ }
+    )
+    foreach ($sentinel in $stdinOnlySentinels.GetEnumerator()) {
+        Assert-True (
+            ([string]$dryInvocation.standardInput).Contains([string]$sentinel.Value)
+        ) "stdin-only $($sentinel.Key) sentinel was missing from the validated prompt"
+        Assert-True (
+            @($dryArguments | Where-Object {
+                $_.Contains([string]$sentinel.Value)
+            }).Count -eq 0
+        ) "stdin-only $($sentinel.Key) sentinel leaked onto validated dry-run argv"
+    }
 
     $ownerSpec = New-OwnerSetupLaunchSpec -Worktree $linkedWorktree `
         -StateDirectory $stateDirectory -Installed $true -Platform 'MacOS'
@@ -317,7 +347,9 @@ done
     Assert-True (
         (Test-ClaudeResultContract -Result $result -Task $validatedTask)
     ) 'runner output did not satisfy the result contract'
-    Assert-True ($result.taskId -ceq 'mac-e2e') 'runner returned the wrong task result'
+    Assert-True (
+        $result.taskId -ceq 'SENTINEL_TASK_ID_MAC_E2E'
+    ) 'runner returned the wrong task result'
 
     $ledgerPath = Join-Path $stateDirectory 'ledger.json'
     $ledger = Read-AndAssertHandoffLedger -LedgerPath $ledgerPath `
@@ -384,16 +416,18 @@ done
             $claudeArguments[$argumentIndex] -ceq $expectedClaudeArguments[$argumentIndex]
         ) "Claude argv[$argumentIndex] differed from the validated invocation"
     }
+    foreach ($sentinel in $stdinOnlySentinels.GetEnumerator()) {
+        Assert-True (
+            @($claudeArguments | Where-Object {
+                $_.Contains([string]$sentinel.Value)
+            }).Count -eq 0
+        ) "stdin-only $($sentinel.Key) sentinel leaked onto captured native argv"
+    }
     Assert-True (
         @($claudeArguments | Where-Object {
             $_ -ceq '--dangerously-skip-permissions'
         }).Count -eq 1
     ) 'validated Claude execution did not receive exactly one permission-bypass argument'
-    Assert-True (
-        @($claudeArguments | Where-Object {
-            $_.Contains($taskPacket.goal) -or $_.Contains('"id": "mac-e2e"')
-        }).Count -eq 0
-    ) 'task prompt content leaked onto Claude argv'
     Assert-True (
         -not (Test-Path -LiteralPath $env:DELEGATION_OPEN_CAPTURE)
     ) 'authenticated delegation opened the owner setup Terminal'
