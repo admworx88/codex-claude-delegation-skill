@@ -15,6 +15,24 @@ function Invoke-Git([string]$Path, [string[]]$Arguments) {
     return ($output -join [Environment]::NewLine).Trim()
 }
 
+function Resolve-LinkTargetPath([string]$Candidate, [string]$Target) {
+    if (-not [System.IO.Path]::IsPathRooted($Candidate)) {
+        throw "Path link candidate must be absolute: $Candidate"
+    }
+    if ([System.IO.Path]::IsPathRooted($Target)) {
+        return [System.IO.Path]::GetFullPath($Target)
+    }
+
+    $parent = [System.IO.Path]::GetDirectoryName($Candidate)
+    if ([string]::IsNullOrEmpty($parent)) {
+        $parent = [System.IO.Path]::GetPathRoot($Candidate)
+    }
+    if ([string]::IsNullOrEmpty($parent)) {
+        throw "Path link candidate does not have a resolvable parent: $Candidate"
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $parent $Target))
+}
+
 function Resolve-CanonicalExistingPathInternal([string]$Path, [int]$LinkDepth) {
     if ($LinkDepth -gt 64) { throw "Path contains too many link indirections: $Path" }
 
@@ -44,14 +62,11 @@ function Resolve-CanonicalExistingPathInternal([string]$Path, [int]$LinkDepth) {
             throw "Path link does not have exactly one resolvable target: $candidate"
         }
         $target = [string]$targets[0]
-        $targetPath = if ([System.IO.Path]::IsPathRooted($target)) {
-            $target
-        } else {
-            Join-Path (Split-Path -Parent $candidate) $target
-        }
+        $targetPath = Resolve-LinkTargetPath -Candidate $candidate -Target $target
         $current = Resolve-CanonicalExistingPathInternal -Path $targetPath -LinkDepth ($LinkDepth + 1)
     }
-    if ($current -eq $root) { return $root }
+    $currentRoot = [System.IO.Path]::GetPathRoot($current)
+    if ($current.Length -eq $currentRoot.Length) { return $currentRoot }
     return $current.TrimEnd('\', '/')
 }
 
@@ -606,21 +621,73 @@ function Invoke-OwnerSetupLaunchSpec($LaunchSpec, [string]$Platform) {
     }
 }
 
+function Assert-SafeOwnerSetupScriptPath(
+    [string]$ScriptPath,
+    [string]$StateDirectory,
+    [string]$Platform
+) {
+    $stateIdentity = Resolve-AbsolutePath $StateDirectory
+    $fullScriptPath = [System.IO.Path]::GetFullPath($ScriptPath)
+    $scriptParent = [System.IO.Path]::GetDirectoryName($fullScriptPath)
+    if ([string]::IsNullOrEmpty($scriptParent)) {
+        throw 'Owner setup script path does not have a parent directory.'
+    }
+    $scriptParentIdentity = Resolve-AbsolutePath $scriptParent
+    if (-not (Test-CanonicalPathEqual -Left $scriptParentIdentity -Right $stateIdentity -Platform $Platform)) {
+        throw 'Owner setup script must be stored directly inside the handoff state directory.'
+    }
+
+    $existingLeaf = Get-Item -LiteralPath $fullScriptPath -Force -ErrorAction SilentlyContinue
+    if ($null -ne $existingLeaf) {
+        $linkTypeProperty = $existingLeaf.PSObject.Properties['LinkType']
+        $linkType = if ($null -eq $linkTypeProperty) { '' } else { [string]$linkTypeProperty.Value }
+        if (($existingLeaf.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $linkType -in @('SymbolicLink', 'Junction')) {
+            throw 'Owner setup script path must not be a link or reparse point.'
+        }
+    }
+
+    return Join-Path $stateIdentity ([System.IO.Path]::GetFileName($fullScriptPath))
+}
+
 function Show-OwnerSetup([string]$Worktree, [string]$StateDirectory, [bool]$Installed) {
     $platform = Get-DelegationPlatform
     $launchSpec = New-OwnerSetupLaunchSpec -Worktree $Worktree -StateDirectory $StateDirectory `
         -Installed $Installed -Platform $platform
     if ($platform -eq 'MacOS') {
-        [System.IO.File]::WriteAllText(
-            $launchSpec.ScriptPath,
-            $launchSpec.ScriptContent,
-            [System.Text.UTF8Encoding]::new($false)
+        $safeScriptPath = Assert-SafeOwnerSetupScriptPath -ScriptPath $launchSpec.ScriptPath `
+            -StateDirectory $StateDirectory -Platform $platform
+        [System.IO.File]::Delete($safeScriptPath)
+        $scriptStream = [System.IO.FileStream]::new(
+            $safeScriptPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
         )
-        $securedScriptPath = Resolve-AbsolutePath $launchSpec.ScriptPath
+        try {
+            $scriptWriter = [System.IO.StreamWriter]::new(
+                $scriptStream,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+            try {
+                $scriptWriter.Write($launchSpec.ScriptContent)
+                $scriptWriter.Flush()
+            } finally {
+                $scriptWriter.Dispose()
+            }
+        } finally {
+            $scriptStream.Dispose()
+        }
+        $securedScriptPath = Resolve-AbsolutePath $safeScriptPath
+        if (-not (Test-CanonicalPathEqual -Left $securedScriptPath -Right $safeScriptPath -Platform $platform)) {
+            throw 'Owner setup script escaped the handoff state directory.'
+        }
         & chmod 700 $securedScriptPath
         if ($LASTEXITCODE -ne 0) {
-            throw "Failed to secure owner setup script: $($launchSpec.ScriptPath)"
+            throw "Failed to secure owner setup script: $safeScriptPath"
         }
+        $launchSpec.ScriptPath = $securedScriptPath
+        $launchSpec.ArgumentList = [object[]]@('-a', 'Terminal', $securedScriptPath)
     }
     $launchProcess = Invoke-OwnerSetupLaunchSpec -LaunchSpec $launchSpec -Platform $platform
     if ($null -ne $launchProcess) {

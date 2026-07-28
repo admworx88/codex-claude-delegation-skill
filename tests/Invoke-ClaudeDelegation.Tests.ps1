@@ -73,6 +73,18 @@ try {
     Assert-True (
         (Resolve-AbsolutePath $escapedTaskAlias) -eq $resolvedPhysicalFile
     ) 'a task packet under a linked parent must resolve outside the state directory so containment checks reject escapes'
+
+    $fixtureRootPath = [System.IO.Path]::GetPathRoot($canonicalPathFixture)
+    $crossRootTarget = Get-PSDrive -PSProvider FileSystem |
+        Where-Object { $_.Root -and $_.Root -ne $fixtureRootPath -and (Test-Path -LiteralPath $_.Root) } |
+        Select-Object -First 1
+    if ($null -ne $crossRootTarget) {
+        $crossRootAlias = Join-Path $canonicalPathFixture 'cross-root-alias'
+        New-Item -ItemType Junction -Path $crossRootAlias -Target $crossRootTarget.Root | Out-Null
+        Assert-True (
+            (Resolve-AbsolutePath $crossRootAlias) -eq $crossRootTarget.Root
+        ) 'a link targeting another filesystem root must preserve the target root separator'
+    }
 } finally {
     $canonicalPathFixtureFull = [System.IO.Path]::GetFullPath($canonicalPathFixture)
     $temporaryRoot = [System.IO.Path]::GetFullPath(

@@ -113,6 +113,10 @@ Assert-True (
 
 . $runner -LibraryMode
 
+Assert-True (
+    (Resolve-LinkTargetPath -Candidate '/var' -Target 'private/var') -ceq '/private/var'
+) 'a root-level relative symlink target must resolve from the filesystem root'
+
 $fixtureRoot = Join-Path (
     [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
 ) ("claude-delegation-macos-e2e-" + [guid]::NewGuid().ToString('N'))
@@ -330,6 +334,32 @@ done
             }).Count -eq 0
         ) "stdin-only $($sentinel.Key) sentinel leaked onto validated dry-run argv"
     }
+
+    $outsideOwnerScriptTarget = Join-Path $fixtureRoot 'outside-owner-script-sentinel.txt'
+    [System.IO.File]::WriteAllText(
+        $outsideOwnerScriptTarget,
+        "outside-owner-script-unchanged`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    $ownerScriptLink = Join-Path $stateDirectory 'claude-owner-setup.command'
+    New-Item -ItemType SymbolicLink -Path $ownerScriptLink `
+        -Target $outsideOwnerScriptTarget | Out-Null
+    $ownerScriptLinkRejected = $false
+    try {
+        Show-OwnerSetup -Worktree $linkedWorktree `
+            -StateDirectory $stateDirectory -Installed $true
+    } catch {
+        $ownerScriptLinkRejected = $true
+    }
+    Assert-True $ownerScriptLinkRejected 'owner setup followed a pre-existing script symlink'
+    Assert-True (
+        (Get-Content -Raw -LiteralPath $outsideOwnerScriptTarget) -ceq
+        "outside-owner-script-unchanged`n"
+    ) 'owner setup overwrote the external target of a pre-existing script symlink'
+    Assert-True (
+        -not (Test-Path -LiteralPath $env:DELEGATION_OPEN_CAPTURE)
+    ) 'rejected owner-script symlink still launched Terminal'
+    Remove-Item -LiteralPath $ownerScriptLink -Force
 
     $ownerSpec = New-OwnerSetupLaunchSpec -Worktree $linkedWorktree `
         -StateDirectory $stateDirectory -Installed $true -Platform 'MacOS'
