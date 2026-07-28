@@ -212,7 +212,9 @@ Return objects with:
 
 For Windows, return the existing `powershell -NoExit` behavior. In
 `Show-OwnerSetup`, write the macOS script as UTF-8 without BOM, execute
-`chmod 700 -- <path>` without shell interpolation, then call `Start-Process`.
+`chmod` with `700` and the canonical absolute script path as separate native
+arguments without shell interpolation, then launch the returned specification.
+Do not place `--` after the mode: macOS BSD `chmod` treats it as a filename.
 
 - [ ] **Step 5: Update all owner-setup call sites**
 
@@ -636,4 +638,3 @@ suite.
 Use the branch-finishing workflow. Merge to `main` only after the user selects
 the integration option and both native CI jobs pass. Verify the merged result,
 push without force, and confirm remote `main` matches the local release commit.
-
