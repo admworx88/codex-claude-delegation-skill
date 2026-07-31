@@ -447,7 +447,33 @@ done
     ) 'stored result did not satisfy the result contract'
     Assert-StringArrayShape -Value $record.changedDuringTask -Name 'changedDuringTask'
     Assert-StringArrayShape -Value $record.scopeViolations -Name 'scopeViolations'
+    Assert-StringArrayShape -Value $record.ignoredArtifacts -Name 'ignoredArtifacts'
     Assert-StringArrayShape -Value $record.repositoryViolations -Name 'repositoryViolations'
+    Assert-True (@($record.ignoredArtifacts).Count -eq 0) 'allowed edit produced a spurious ignored artifact'
+
+    Set-Content -LiteralPath (Join-Path $linkedWorktree '.gitignore') -Value 'build/' -NoNewline
+    New-Item -ItemType Directory -Force -Path (Join-Path $linkedWorktree 'build') | Out-Null
+    Set-Content -LiteralPath (Join-Path $linkedWorktree 'build/output.txt') -Value 'artifact'
+    $macClassification = Get-ScopeClassification -Worktree $linkedWorktree -Task $validatedTask `
+        -ChangedPaths @('build/output.txt', 'not-ignored.txt')
+    Assert-True (
+        $macClassification.IgnoredArtifacts -ccontains 'build/output.txt'
+    ) 'a git-ignored byproduct was not classified as an artifact on macOS'
+    Assert-True (
+        $macClassification.Violations -ccontains 'not-ignored.txt'
+    ) 'an untracked out-of-scope file escaped the macOS scope check'
+    Assert-True (-not $macClassification.ProbeFailed) 'the macOS ignore probe failed on a healthy worktree'
+
+    # Set-Content -NoNewline left the rule unterminated; the handoff rule must not
+    # be glued onto it.
+    Add-HandoffIgnoreRule -IgnorePath (Join-Path $linkedWorktree '.gitignore')
+    $macIgnoreRules = @(
+        [System.IO.File]::ReadAllText((Join-Path $linkedWorktree '.gitignore')) -split "`r?`n" |
+            Where-Object { $_ -ne '' }
+    )
+    Assert-True ($macIgnoreRules -ccontains 'build/') 'appending the handoff rule rewrote the final macOS .gitignore entry'
+    Assert-True ($macIgnoreRules -ccontains '.codex/claude-handoff/') 'the handoff ignore rule was not appended on macOS'
+    Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('packages/api/.gitignore')).Count -eq 1) 'a nested .gitignore change was not detected on macOS'
 
     $afterMetadata = Get-GitMetadataSnapshot -Context $context
     $afterSiblings = Get-SiblingWorktreeFingerprint -Context $context
@@ -459,7 +485,8 @@ done
         'IndexFile',
         'Refs',
         'RepositoryConfig',
-        'WorktreeConfig'
+        'WorktreeConfig',
+        'ExcludeFiles'
     )) {
         Assert-True (
             $beforeMetadata.$property -ceq $afterMetadata.$property

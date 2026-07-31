@@ -142,16 +142,29 @@ rerun the same guarded command and packet.
 
 The runner denies Claude Git access in layers: task/prompt prohibitions plus
 Bash and native PowerShell tool denial. It snapshots files, sibling worktrees,
-the index, all refs, repository/worktree configuration, HEAD, branch, remotes,
-and status before and after execution. Any forbidden-path, out-of-scope,
-Git-state, sibling-worktree, or probe violation makes the runner decision
-`rejected`.
+the index, all refs, repository/worktree configuration, exclude files, HEAD,
+branch, remotes, and status before and after execution. Any forbidden-path,
+out-of-scope, Git-state, sibling-worktree, or probe violation makes the runner
+decision `rejected`.
+
+Verification commands legitimately write build and cache output outside
+`allowedPaths`. A changed path that is outside `allowedPaths`, does not match
+`forbiddenPaths`, and is ignored by Git is recorded as `ignoredArtifacts`
+instead of `scopeViolations`; it does not reject the delegation. Three rules
+keep that from becoming a loophole: a `forbiddenPaths` match is always a
+violation regardless of Git's ignore rules, Git never reports a tracked file as
+ignored so tracked out-of-scope edits still reject, and any change to a
+`.gitignore` file or to an exclude file records `ignore-rules-changed` and
+rejects. Read `ignoredArtifacts` during review; the runner does not treat it as
+clean, only as not-a-scope-violation.
 
 After a `needs-review` result, Codex must:
 
 1. Inspect the ledger, normalized result, raw logs when needed, `git status`,
    and the complete diff.
-2. Confirm every changed path is allowed and no forbidden path changed.
+2. Confirm every changed path is allowed and no forbidden path changed, and
+   review `ignoredArtifacts` for anything that is not ordinary build or cache
+   output.
 3. Review correctness, security, deviations, and every acceptance criterion.
 4. Independently rerun the required verification commands; never rely only on
    Claude's report.

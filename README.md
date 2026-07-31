@@ -836,10 +836,20 @@ the ledger.
   accepts or rejects, and owns every Git operation.
 - Claude may edit only task-packet `allowedPaths` and returns untrusted
   candidate evidence.
-- The runner rejects forbidden paths, Git-state changes, sibling-worktree
-  changes, and unsafe packet or host conditions.
-- Claude never commits, pushes, pulls, merges, rebases, resets, checks out,
-  switches branches, stashes, tags, edits remotes, or creates worktrees.
+- The runner rejects writes to forbidden paths, out-of-scope writes, Git-state
+  changes, ignore-rule changes, sibling-worktree changes, and unsafe packet or
+  host conditions. Detection is based on before/after file and Git-state
+  snapshots, so it observes what Claude *wrote*, not what it read.
+- Build and cache output that Git ignores is recorded as `ignoredArtifacts` for
+  review rather than rejected, so a required verification command does not fail
+  its own delegation. Anything matching `forbiddenPaths`, any tracked file, and
+  any change to a `.gitignore` or exclude file still rejects.
+- Claude is denied Git tool access and any commit, push, pull, merge, rebase,
+  reset, checkout, branch switch, stash, tag, remote edit, or worktree creation
+  is detected by the before/after snapshots. Denial is enforced by Claude Code
+  permission rules over Bash and PowerShell commands; work that reaches Git
+  indirectly, such as through a shell script, is caught by detection rather
+  than prevented.
 - No automatic commit or push occurs after Claude finishes. Codex acts only
   after independent review, acceptance, and owner direction.
 

@@ -88,6 +88,94 @@ Assert-True (
     (Remove-TrailingPathSeparatorsExceptRoot '\\server\share\') -ceq '\\server\share\'
 ) 'UNC roots must preserve their trailing root separator'
 
+$nativeCaptureRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'claude-delegation-native-capture-' + [guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $nativeCaptureRoot -Force | Out-Null
+    $noisyCommand = Join-Path $nativeCaptureRoot 'noisy.cmd'
+    @'
+@echo off
+echo advisory text 1>&2
+echo standard output
+exit /b 0
+'@ | Set-Content -LiteralPath $noisyCommand -Encoding ASCII
+
+    # $ErrorActionPreference is 'Stop' for this whole suite, which is exactly the
+    # condition under which Windows PowerShell 5.1 turns native stderr into a
+    # terminating error. Git emits advisory stderr on successful commands.
+    $noisyResult = Invoke-DelegationNativeCommand -Command $noisyCommand -Arguments @()
+    Assert-True ($noisyResult.ExitCode -eq 0) 'stderr on a successful native command changed its reported exit code'
+    Assert-True ($noisyResult.StandardOutput.Trim() -ceq 'standard output') "native stdout was contaminated by stderr: $($noisyResult.StandardOutput)"
+    Assert-True ($noisyResult.StandardError -match 'advisory text') 'native stderr was not captured for diagnostics'
+    Assert-True ($noisyResult.Combined -match 'advisory text') 'combined native output dropped stderr'
+
+    $failingCommand = Join-Path $nativeCaptureRoot 'failing.cmd'
+    @'
+@echo off
+echo fatal detail 1>&2
+exit /b 3
+'@ | Set-Content -LiteralPath $failingCommand -Encoding ASCII
+    $failingResult = Invoke-DelegationNativeCommand -Command $failingCommand -Arguments @()
+    Assert-True ($failingResult.ExitCode -eq 3) 'a failing native command did not report its exit code'
+    Assert-True ($failingResult.Combined -match 'fatal detail') 'a failing native command lost its stderr detail'
+} finally {
+    if (Test-Path -LiteralPath $nativeCaptureRoot) {
+        Remove-Item -LiteralPath $nativeCaptureRoot -Recurse -Force
+    }
+}
+
+$ignoreRuleRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'claude-delegation-ignore-rule-' + [guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $ignoreRuleRoot -Force | Out-Null
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    $unterminatedPath = Join-Path $ignoreRuleRoot 'unterminated.gitignore'
+    [System.IO.File]::WriteAllText($unterminatedPath, "node_modules`nbuild/output", $utf8NoBom)
+    Add-HandoffIgnoreRule -IgnorePath $unterminatedPath
+    $unterminatedRules = @([System.IO.File]::ReadAllText($unterminatedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($unterminatedRules -ccontains 'build/output') "appending the handoff rule rewrote the final existing entry: $($unterminatedRules -join '|')"
+    Assert-True ($unterminatedRules -ccontains '.codex/claude-handoff/') 'the handoff ignore rule was not appended'
+    Assert-True ($unterminatedRules.Count -eq 3) "unexpected .gitignore contents: $($unterminatedRules -join '|')"
+
+    Add-HandoffIgnoreRule -IgnorePath $unterminatedPath
+    $repeatedRules = @([System.IO.File]::ReadAllText($unterminatedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($repeatedRules.Count -eq 3) 'the handoff ignore rule was appended twice'
+
+    $rootedPath = Join-Path $ignoreRuleRoot 'rooted.gitignore'
+    [System.IO.File]::WriteAllText($rootedPath, "/.codex/claude-handoff/`n", $utf8NoBom)
+    Add-HandoffIgnoreRule -IgnorePath $rootedPath
+    $rootedRules = @([System.IO.File]::ReadAllText($rootedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($rootedRules.Count -eq 1) "an equivalent rooted handoff rule was duplicated: $($rootedRules -join '|')"
+
+    $unslashedPath = Join-Path $ignoreRuleRoot 'unslashed.gitignore'
+    [System.IO.File]::WriteAllText($unslashedPath, ".codex/claude-handoff`n", $utf8NoBom)
+    Add-HandoffIgnoreRule -IgnorePath $unslashedPath
+    $unslashedRules = @([System.IO.File]::ReadAllText($unslashedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($unslashedRules.Count -eq 1) "an equivalent unslashed handoff rule was duplicated: $($unslashedRules -join '|')"
+
+    $createdPath = Join-Path $ignoreRuleRoot 'created.gitignore'
+    Add-HandoffIgnoreRule -IgnorePath $createdPath
+    $createdRules = @([System.IO.File]::ReadAllText($createdPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($createdRules -ccontains '.codex/claude-handoff/') 'a missing .gitignore was not created with the handoff rule'
+} finally {
+    if (Test-Path -LiteralPath $ignoreRuleRoot) {
+        Remove-Item -LiteralPath $ignoreRuleRoot -Recurse -Force
+    }
+}
+
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('src/app.ts')).Count -eq 0) 'an ordinary change was reported as an ignore-rule change'
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('.gitignore')).Count -eq 1) 'a root .gitignore change was not detected'
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('packages/api/.gitignore')).Count -eq 1) 'a nested .gitignore change was not detected'
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('src\nested\.gitignore')).Count -eq 1) 'a Windows-separated .gitignore change was not detected'
+
 Assert-True ((Get-PathStringComparison -Platform 'Windows') -eq [System.StringComparison]::OrdinalIgnoreCase) 'Windows paths must use ordinal case-insensitive comparison'
 Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComparison]::Ordinal) 'macOS paths must use ordinal case-sensitive comparison'
 Assert-True (Test-CanonicalPathEqual -Left 'C:\Delegation\Task.json' -Right 'c:\delegation\task.json' -Platform 'Windows') 'Windows canonical paths must compare case-insensitively'
@@ -667,6 +755,15 @@ if "%CLAUDE_FAKE_MODE%"=="allowed-edit" (
 if "%CLAUDE_FAKE_MODE%"=="ignored-edit" (
   echo delegated-secret>>"%CD%\.env"
 )
+if "%CLAUDE_FAKE_MODE%"=="artifact-edit" (
+  echo delegated-change>>"%CD%\src\parser.ps1"
+  if not exist "%CD%\build" mkdir "%CD%\build"
+  echo build-output>"%CD%\build\output.txt"
+)
+if "%CLAUDE_FAKE_MODE%"=="ignore-widen" (
+  echo delegated-artifact>>"%CD%\.gitignore"
+  echo widened>"%CD%\delegated-artifact"
+)
 if "%CLAUDE_FAKE_MODE%"=="forbidden-edit" (
   if not exist "%CD%\.github\workflows" mkdir "%CD%\.github\workflows"
   echo forbidden>"%CD%\.github\workflows\ci.yml"
@@ -1178,6 +1275,36 @@ exit /b 0
     Assert-True (@($allowedRecord.scopeViolations).Count -eq 0) 'allowed path was rejected'
     Assert-True ($allowedRecord.status -eq 'needs-review') 'an allowed unstaged edit was falsely classified as a repository mutation'
 
+    # A required verification command legitimately drops build and cache output
+    # outside allowedPaths. Ignored byproducts must be reported, never rejected.
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value 'build/'
+    $env:CLAUDE_FAKE_MODE = 'artifact-edit'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $artifactRecord = @($ledger.tasks)[-1]
+    Assert-True ($artifactRecord.changedDuringTask -contains 'build/output.txt') 'ignored build output bypassed fingerprinting'
+    Assert-True ($artifactRecord.ignoredArtifacts -contains 'build/output.txt') 'ignored build output was not recorded as an artifact'
+    Assert-True (-not ($artifactRecord.scopeViolations -contains 'build/output.txt')) 'a git-ignored build artifact was treated as a scope violation'
+    Assert-True (@($artifactRecord.scopeViolations).Count -eq 0) "verification artifacts rejected a compliant delegation: $(@($artifactRecord.scopeViolations) -join '|')"
+    Assert-True ($artifactRecord.status -eq 'needs-review') 'a delegation was rejected for output its own verification command created'
+
+    # Widening the ignore set is how a delegation would launder an out-of-scope
+    # write into the artifact bucket, so it must reject on its own.
+    $env:CLAUDE_FAKE_MODE = 'ignore-widen'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $ignoreWidenRecord = @($ledger.tasks)[-1]
+    Assert-True ($ignoreWidenRecord.repositoryViolations -contains 'ignore-rules-changed') 'a delegated .gitignore edit was not recorded'
+    Assert-True ($ignoreWidenRecord.status -eq 'rejected') 'a delegation that widened the ignore set was not rejected'
+
     Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value '.env'
     Set-Content -LiteralPath (Join-Path $linked '.env') -Value 'ignored-before'
     $env:CLAUDE_FAKE_MODE = 'ignored-edit'
@@ -1200,6 +1327,37 @@ exit /b 0
     $windowsPatternViolations = Get-ScopeViolations -ChangedPaths @('.github/workflows/ci.yml', 'src/parser.ps1') -Task $windowsPatternTask
     Assert-True ($windowsPatternViolations -contains '.github/workflows/ci.yml') 'Windows forbidden pattern was not normalized'
     Assert-True (-not ($windowsPatternViolations -contains 'src/parser.ps1')) 'Windows allowed pattern was not normalized'
+
+    # By now the fixture .gitignore covers build/, delegated-artifact and .env.
+    $classification = Get-ScopeClassification -Worktree $linked -Task $executionTask -ChangedPaths @(
+        'src/parser.ps1', 'build/output.txt', 'not-ignored.txt', '.github/workflows/ci.yml', '.env'
+    )
+    Assert-True (-not ($classification.Violations -contains 'src/parser.ps1')) 'an allowed path was classified as a violation'
+    Assert-True (-not ($classification.IgnoredArtifacts -contains 'src/parser.ps1')) 'an allowed path was classified as an artifact'
+    Assert-True ($classification.IgnoredArtifacts -contains 'build/output.txt') 'a git-ignored byproduct was not classified as an artifact'
+    Assert-True (-not ($classification.Violations -contains 'build/output.txt')) 'a git-ignored byproduct was still counted as a violation'
+    Assert-True ($classification.Violations -contains 'not-ignored.txt') 'an untracked out-of-scope file escaped the scope check'
+    Assert-True ($classification.Violations -contains '.github/workflows/ci.yml') 'a forbidden path escaped the scope check'
+    Assert-True ($classification.Violations -contains '.env') 'a forbidden path was laundered into an artifact by .gitignore'
+    Assert-True (-not ($classification.IgnoredArtifacts -contains '.env')) 'a forbidden path was classified as an artifact'
+    Assert-True (-not $classification.ProbeFailed) 'the ignore probe failed on a healthy worktree'
+
+    # Git never reports a tracked file as ignored, so an out-of-scope edit to a
+    # tracked file stays a violation even when an ignore rule matches its name.
+    # seed.txt is committed in the fixture repository.
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value 'seed.txt'
+    $trackedIgnoreTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $trackedIgnoreTask.allowedPaths = @('src/**')
+    $trackedClassification = Get-ScopeClassification -Worktree $linked -Task $trackedIgnoreTask `
+        -ChangedPaths @('seed.txt')
+    Assert-True ($trackedClassification.Violations -contains 'seed.txt') 'a tracked out-of-scope file was reclassified as an artifact'
+    Assert-True (@($trackedClassification.IgnoredArtifacts).Count -eq 0) 'a tracked file was classified as an ignored artifact'
+
+    $probeFailure = Get-ScopeClassification -Worktree (Join-Path $fixtureRoot 'no-such-worktree') `
+        -Task $executionTask -ChangedPaths @('build/output.txt')
+    Assert-True $probeFailure.ProbeFailed 'a broken ignore probe was not reported'
+    Assert-True ($probeFailure.Violations -contains 'build/output.txt') 'a broken ignore probe failed open instead of closed'
+    Assert-True (@($probeFailure.IgnoredArtifacts).Count -eq 0) 'a broken ignore probe still produced artifacts'
 
     $env:CLAUDE_FAKE_MODE = 'forbidden-edit'
     try {

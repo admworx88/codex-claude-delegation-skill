@@ -9,10 +9,35 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Invoke-DelegationNativeCommand([string]$Command, [string[]]$Arguments) {
+    # Windows PowerShell 5.1 converts native stderr into terminating errors when
+    # the stream is redirected while $ErrorActionPreference is 'Stop'. Git and
+    # Claude both write advisory text to stderr on success, so relax the
+    # preference for this call only; function scope restores it on return.
+    $ErrorActionPreference = 'Continue'
+    $merged = @(& $Command @Arguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    $standardOutput = @()
+    $standardError = @()
+    foreach ($record in $merged) {
+        if ($record -is [System.Management.Automation.ErrorRecord]) {
+            $standardError += [string]$record
+        } else {
+            $standardOutput += [string]$record
+        }
+    }
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        StandardOutput = ($standardOutput -join [Environment]::NewLine)
+        StandardError = ($standardError -join [Environment]::NewLine)
+        Combined = (@($merged | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)
+    }
+}
+
 function Invoke-Git([string]$Path, [string[]]$Arguments) {
-    $output = & git -C $Path @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "Git failed: $($output -join [Environment]::NewLine)" }
-    return ($output -join [Environment]::NewLine).Trim()
+    $result = Invoke-DelegationNativeCommand -Command 'git' -Arguments (@('-C', $Path) + $Arguments)
+    if ($result.ExitCode -ne 0) { throw "Git failed: $($result.Combined)" }
+    return $result.StandardOutput.Trim()
 }
 
 function Resolve-LinkTargetPath([string]$Candidate, [string]$Target) {
@@ -163,14 +188,34 @@ function Assert-LinkedWorktree($Context) {
     if ([string]::IsNullOrWhiteSpace($Context.branch)) { throw 'Detached HEAD is not allowed.' }
 }
 
+function Add-HandoffIgnoreRule([string]$IgnorePath) {
+    $rule = '.codex/claude-handoff/'
+    $existingText = if (Test-Path -LiteralPath $IgnorePath -PathType Leaf) {
+        [System.IO.File]::ReadAllText($IgnorePath)
+    } else {
+        ''
+    }
+    $existingRules = @($existingText -split "`r?`n" | ForEach-Object { ([string]$_).Trim().TrimStart('/') })
+    if ($existingRules -contains $rule -or $existingRules -contains $rule.TrimEnd('/')) { return }
+    # Add-Content would glue the rule onto a final line that has no terminator,
+    # silently rewriting the last existing entry.
+    $separator = ''
+    if ($existingText.Length -gt 0) {
+        $lastCharacter = $existingText[$existingText.Length - 1]
+        if ($lastCharacter -ne "`n" -and $lastCharacter -ne "`r") { $separator = [Environment]::NewLine }
+    }
+    [System.IO.File]::AppendAllText(
+        $IgnorePath,
+        ($separator + $rule + [Environment]::NewLine),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
 function Initialize-HandoffState($Context, $Task) {
     if ($null -eq $Task) { throw 'A validated task packet is required to initialize handoff state.' }
     $stateDir = Join-Path $Context.worktreePath '.codex/claude-handoff'
     New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
-    $ignorePath = Join-Path $Context.worktreePath '.gitignore'
-    $rule = '.codex/claude-handoff/'
-    $existing = if (Test-Path -LiteralPath $ignorePath) { Get-Content -LiteralPath $ignorePath } else { @() }
-    if ($existing -notcontains $rule) { Add-Content -LiteralPath $ignorePath -Value $rule }
+    Add-HandoffIgnoreRule -IgnorePath (Join-Path $Context.worktreePath '.gitignore')
     $ledgerPath = Join-Path $stateDir 'ledger.json'
     if (-not (Test-Path -LiteralPath $ledgerPath)) {
         [ordered]@{
@@ -504,9 +549,9 @@ function Resolve-ClaudeCommandPath([string]$Command) {
 
 function Test-ClaudeAuthenticated([string]$Command) {
     try {
-        $output = & $Command auth status 2>&1
-        if ($LASTEXITCODE -ne 0) { return $false }
-        $status = ($output -join [Environment]::NewLine) | ConvertFrom-Json
+        $result = Invoke-DelegationNativeCommand -Command $Command -Arguments @('auth', 'status')
+        if ($result.ExitCode -ne 0) { return $false }
+        $status = $result.StandardOutput | ConvertFrom-Json
         if ($null -ne $status.loggedIn) { return [bool]$status.loggedIn }
         if ($null -ne $status.authenticated) { return [bool]$status.authenticated }
         return $true
@@ -871,6 +916,36 @@ function Compare-SiblingWorktreeFingerprint([hashtable]$Before, [hashtable]$Afte
     return @($all | Where-Object { $Before[$_] -cne $After[$_] })
 }
 
+function Get-CoreExcludesFileIdentity($Context) {
+    $result = Invoke-DelegationNativeCommand -Command 'git' -Arguments @(
+        '-C', $Context.worktreePath, 'config', '--get', 'core.excludesFile'
+    )
+    if ($result.ExitCode -ne 0) { return '<unset>' }
+    $value = $result.StandardOutput.Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return '<unset>' }
+    if ($value.StartsWith('~')) {
+        $profileRoot = [Environment]::GetFolderPath('UserProfile')
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = $env:HOME }
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) { return "$value=<unresolved>" }
+        $value = Join-Path $profileRoot $value.Substring(1).TrimStart('/', '\')
+    }
+    if (-not [System.IO.Path]::IsPathRooted($value)) {
+        $value = Join-Path $Context.worktreePath $value
+    }
+    return "$value=$(Get-FileIdentity $value)"
+}
+
+function Get-ExcludeFileFingerprint($Context) {
+    # Worktree .gitignore files are covered by the filesystem fingerprint; these
+    # exclude sources live outside it and would otherwise let a delegation widen
+    # the ignore set and reclassify its own out-of-scope writes as artifacts.
+    return (@(
+        "common=$(Get-FileIdentity (Join-Path $Context.commonDir 'info/exclude'))"
+        "worktree=$(Get-FileIdentity (Join-Path $Context.gitDir 'info/exclude'))"
+        "core.excludesFile=$(Get-CoreExcludesFileIdentity -Context $Context)"
+    ) -join '|')
+}
+
 function Get-GitMetadataSnapshot($Context) {
     $refs = @(Invoke-Git $Context.worktreePath @('for-each-ref', '--format=%(refname)%09%(objectname)%09%(symref)') -split "`r?`n" |
         Where-Object { $_ -ne '' } | Sort-Object) -join "`n"
@@ -887,6 +962,7 @@ function Get-GitMetadataSnapshot($Context) {
         Refs = $refs
         RepositoryConfig = Get-FileIdentity (Join-Path $Context.commonDir 'config')
         WorktreeConfig = Get-FileIdentity (Join-Path $Context.gitDir 'config.worktree')
+        ExcludeFiles = Get-ExcludeFileFingerprint -Context $Context
     }
 }
 
@@ -915,6 +991,87 @@ function Get-ScopeViolations([string[]]$ChangedPaths, $Task) {
         if ($forbidden -or -not $allowed) { $violations += $normalized }
     }
     return @($violations | Sort-Object -Unique)
+}
+
+function Get-GitIgnoredPathSet([string]$Worktree, [string[]]$CandidatePaths) {
+    $ignored = New-PathIdentityMap -Platform (Get-DelegationPlatform)
+    $candidates = @($CandidatePaths)
+    if ($candidates.Count -eq 0) { return $ignored }
+    $batchSize = 100
+    for ($offset = 0; $offset -lt $candidates.Count; $offset += $batchSize) {
+        $last = [math]::Min($offset + $batchSize, $candidates.Count) - 1
+        $batch = @($candidates[$offset..$last])
+        # No --no-index: Git never reports a tracked file as ignored, so a change
+        # to a tracked out-of-scope file can never be reclassified as an artifact.
+        $result = Invoke-DelegationNativeCommand -Command 'git' -Arguments (
+            @('-C', $Worktree, '-c', 'core.quotePath=false', 'check-ignore', '--') + $batch
+        )
+        # check-ignore exits 1 when no candidate matched, which is not an error.
+        if ($result.ExitCode -ne 0 -and $result.ExitCode -ne 1) {
+            throw "Git ignore probe failed: $($result.Combined)"
+        }
+        foreach ($line in @($result.StandardOutput -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            # A path Git still quotes (embedded quote or newline) will not match a
+            # candidate and therefore stays classified as a scope violation.
+            $ignored[$line.Replace('\', '/').Trim()] = $true
+        }
+    }
+    return $ignored
+}
+
+function Get-ScopeClassification([string[]]$ChangedPaths, $Task, [string]$Worktree) {
+    $patternViolations = @(Get-ScopeViolations -ChangedPaths $ChangedPaths -Task $Task)
+    if ($patternViolations.Count -eq 0) {
+        return [pscustomobject]@{ Violations = @(); IgnoredArtifacts = @(); ProbeFailed = $false }
+    }
+
+    # A forbidden path is never an artifact, whatever .gitignore says about it.
+    $forbiddenPatterns = @($Task.forbiddenPaths | ForEach-Object { ([string]$_).Replace('\', '/') })
+    $violations = @()
+    $candidates = @()
+    foreach ($path in $patternViolations) {
+        if (@($forbiddenPatterns | Where-Object { $path -like $_ }).Count -gt 0) {
+            $violations += $path
+        } else {
+            $candidates += $path
+        }
+    }
+    if (@($candidates).Count -eq 0) {
+        return [pscustomobject]@{
+            Violations = @($violations | Sort-Object -Unique)
+            IgnoredArtifacts = @()
+            ProbeFailed = $false
+        }
+    }
+
+    try {
+        $ignored = Get-GitIgnoredPathSet -Worktree $Worktree -CandidatePaths $candidates
+    } catch {
+        # Fail closed: an unusable ignore probe must never soften the decision.
+        return [pscustomobject]@{
+            Violations = @(@($violations) + @($candidates) | Sort-Object -Unique)
+            IgnoredArtifacts = @()
+            ProbeFailed = $true
+        }
+    }
+
+    $artifacts = @()
+    foreach ($candidate in $candidates) {
+        if ($ignored.ContainsKey($candidate)) { $artifacts += $candidate } else { $violations += $candidate }
+    }
+    return [pscustomobject]@{
+        Violations = @($violations | Sort-Object -Unique)
+        IgnoredArtifacts = @($artifacts | Sort-Object -Unique)
+        ProbeFailed = $false
+    }
+}
+
+function Get-IgnoreRuleChanges([string[]]$ChangedPaths) {
+    return @($ChangedPaths | Where-Object {
+        $leaf = (([string]$_) -replace '\\', '/').Split('/')[-1]
+        [string]::Equals($leaf, '.gitignore', [System.StringComparison]::OrdinalIgnoreCase)
+    })
 }
 
 function Get-GitProbe([string]$Worktree, [string[]]$Arguments, [string]$Name) {
@@ -1249,9 +1406,9 @@ function ConvertFrom-ClaudeOutput([string]$Output, $Task, [bool]$TimedOut, [int]
 
 function Get-ClaudeVersionSupport([string]$ClaudeCommand) {
     try {
-        $versionOutput = & $ClaudeCommand --version 2>&1
-        if ($LASTEXITCODE -ne 0) { return $false }
-        return Test-ForwardSubagentSupport -VersionText ($versionOutput -join [Environment]::NewLine)
+        $result = Invoke-DelegationNativeCommand -Command $ClaudeCommand -Arguments @('--version')
+        if ($result.ExitCode -ne 0) { return $false }
+        return Test-ForwardSubagentSupport -VersionText $result.StandardOutput
     } catch {
         return $false
     }
@@ -1326,8 +1483,15 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         } else {
             @()
         }
-        $scopeViolations = Get-ScopeViolations -ChangedPaths $changedDuringTask -Task $Task
+        $scopeClassification = Get-ScopeClassification -ChangedPaths $changedDuringTask -Task $Task `
+            -Worktree $Context.worktreePath
+        $scopeViolations = @($scopeClassification.Violations)
+        $ignoredArtifacts = @($scopeClassification.IgnoredArtifacts)
         $repositoryViolations = @()
+        if ($scopeClassification.ProbeFailed) { $repositoryViolations += 'ignore-probe-failed' }
+        if (@(Get-IgnoreRuleChanges -ChangedPaths $changedDuringTask).Count -gt 0) {
+            $repositoryViolations += 'ignore-rules-changed'
+        }
         foreach ($probe in @($endingHeadProbe, $endingBranchProbe, $endingRemotesProbe, $endingStatusProbe, $endingMetadataProbe, $endingSiblingsProbe, $afterFingerprintProbe)) {
             if (-not $probe.Success) { $repositoryViolations += $probe.Violation }
         }
@@ -1343,6 +1507,9 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             if ($startingMetadata.RepositoryConfig -cne $endingMetadataProbe.Value.RepositoryConfig -or
                 $startingMetadata.WorktreeConfig -cne $endingMetadataProbe.Value.WorktreeConfig) {
                 $repositoryViolations += 'config-changed'
+            }
+            if ($startingMetadata.ExcludeFiles -cne $endingMetadataProbe.Value.ExcludeFiles) {
+                $repositoryViolations += 'ignore-rules-changed'
             }
         }
         if ($endingSiblingsProbe.Success -and
@@ -1368,6 +1535,7 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             endingGitStatus = $endingStatusProbe.Value
             changedDuringTask = @($changedDuringTask)
             scopeViolations = @($scopeViolations)
+            ignoredArtifacts = @($ignoredArtifacts)
             repositoryViolations = @($repositoryViolations)
             rawOutputPath = $process.RawOutputPath
             rawErrorPath = $process.RawErrorPath
