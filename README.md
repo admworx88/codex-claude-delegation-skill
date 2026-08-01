@@ -798,7 +798,15 @@ owner approval.
 
 ### Local tests or GitHub Actions fail
 
-From this repository root, run the test for the current host.
+From this repository root, run the test for the current host. A third suite,
+`tests/Claude-CliContract.Tests.ps1`, checks that the installed Claude Code CLI
+still accepts every flag the runner depends on; the other two suites use a fake
+Claude command and cannot detect an upstream flag rename. It skips itself when
+Claude Code is not installed:
+
+```text
+pwsh -NoProfile -File ./tests/Claude-CliContract.Tests.ps1
+```
 
 Windows:
 

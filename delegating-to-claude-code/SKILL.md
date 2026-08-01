@@ -44,9 +44,17 @@ or discard prior evidence.
 
 | Mode | Select only when | Execution contract |
 |---|---|---|
-| `direct` | Work is small or tightly coupled. | One Claude process works directly. No subagents or teammates. |
+| `direct` | Work is small or tightly coupled. | One Claude process works directly. The runner removes the subagent tool, so no subagents or teammates are possible. |
 | `subagents` | A medium task has focused independent investigation, implementation, review, or test subtasks. | Send one top-level task. Claude uses focused subagents internally and returns one consolidated result. |
 | `agent-team` | Work is long and has at least two truly independent, non-overlapping workstreams. | Send one top-level task. Declare exclusive paths, keep the team small, and require conservative `maxTurns`, `timeoutSeconds`, and `maxBudgetUsd`. |
+
+**Ownership is checked, not attributed.** A filesystem snapshot cannot tell
+which teammate wrote a file, so per-teammate `ownedPaths` compliance is not
+verifiable after the fact. The runner checks the part that is: every in-scope
+change must land inside exactly one declared `ownedPaths` set. Anything in
+`allowedPaths` that no workstream owns, or that two workstreams claim, is
+recorded as `unownedPaths` for Codex review. Overlap itself is rejected when the
+packet is validated, before Claude runs.
 
 Independence does not authorize concurrent top-level delegations or multiple
 worktrees. Prepared parallel briefs, deadline pressure, and sunk cost do not

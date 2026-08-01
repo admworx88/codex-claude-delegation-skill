@@ -585,6 +585,15 @@ Assert-True (
     $collectedDenyRules.Count -eq $derivedDenyRules.Count
 ) "deny rules were split by an intervening flag: expected $($derivedDenyRules.Count), collected $($collectedDenyRules.Count)"
 
+# direct mode promises no subagents. The subagent tool is named Agent; a rule
+# naming a tool that does not exist would silently enforce nothing.
+Assert-True ($derivedDenyRules -ccontains 'Agent') 'direct mode did not deny the subagent tool'
+$subagentModeTask = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$subagentModeTask.mode = 'subagents'
+$subagentDenyRules = Get-DelegationDenyRules -Task $subagentModeTask -Context $denyRuleContext
+Assert-True (-not ($subagentDenyRules -ccontains 'Agent')) 'subagents mode must keep the subagent tool available'
+Assert-True (@($subagentDenyRules | Where-Object { $_ -like 'Read(*' }).Count -gt 0) 'subagents mode lost its path deny rules'
+
 foreach ($invalidLimit in @(
     [pscustomobject]@{ property = 'maxTurns'; value = 0; message = 'zero maxTurns must be rejected' },
     [pscustomobject]@{ property = 'maxTurns'; value = 1.5; message = 'fractional maxTurns must be rejected' },
@@ -646,6 +655,35 @@ Assert-True ($teamInvocation.freshSession) 'team mode must use a fresh session'
 Assert-True ($teamInvocation.environment['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS'] -eq '1') 'team env missing'
 Assert-True ($teamInvocation.arguments -contains '--forward-subagent-text') 'stream forwarding missing'
 Assert-True (-not ($teamInvocation.arguments -contains '--resume')) 'team mode must not resume a prior session'
+Assert-True (-not ((Get-DelegationDenyRules -Task $team -Context $null) -ccontains 'Agent')) 'agent-team mode must keep the subagent tool available'
+
+# A filesystem snapshot cannot attribute a write to one teammate, so declared
+# ownership is unverifiable per teammate. What is checkable is that every
+# in-scope change landed in exactly one declared ownedPaths set.
+Assert-True (
+    @(Get-UnownedWorkstreamPaths -ChangedPaths @('src/api/routes.ts', 'src/ui/app.tsx') -Task $team).Count -eq 0
+) 'changes inside a single declared owner were reported as unowned'
+$teamUnowned = Get-UnownedWorkstreamPaths -Task $team -ChangedPaths @(
+    'src/api/routes.ts', 'src/shared/config.ts', 'docs/readme.md'
+)
+Assert-True (-not ($teamUnowned -contains 'src/api/routes.ts')) 'an owned path was reported as unowned'
+Assert-True (-not ($teamUnowned -contains 'docs/readme.md')) 'an out-of-scope path belongs to the scope check, not the ownership check'
+$teamWideAllow = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$teamWideAllow.allowedPaths = @('src/**')
+Assert-True (
+    (Get-UnownedWorkstreamPaths -Task $teamWideAllow -ChangedPaths @('src/shared/config.ts')) -contains 'src/shared/config.ts'
+) 'an in-scope change owned by no workstream was not reported'
+$teamDoubleOwned = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$teamDoubleOwned.parallelWorkstreams = @(
+    [pscustomobject]@{ name='api'; ownedPaths=@('src/api/**') },
+    [pscustomobject]@{ name='ui'; ownedPaths=@('src/api/**') }
+)
+Assert-True (
+    (Get-UnownedWorkstreamPaths -Task $teamDoubleOwned -ChangedPaths @('src/api/routes.ts')) -contains 'src/api/routes.ts'
+) 'a change claimed by two workstreams was not reported'
+Assert-True (
+    @(Get-UnownedWorkstreamPaths -ChangedPaths @('src/parser.ps1') -Task $direct).Count -eq 0
+) 'the ownership check must not apply outside agent-team mode'
 Assert-True (Test-ForwardSubagentSupport -VersionText '2.1.211 (Claude Code)') 'supported forwarding version rejected'
 Assert-True (-not (Test-ForwardSubagentSupport -VersionText '2.1.210 (Claude Code)')) 'unsupported forwarding version accepted'
 Assert-True (-not (Test-ForwardSubagentSupport -VersionText 'invalid')) 'invalid forwarding version accepted'

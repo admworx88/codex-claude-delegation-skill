@@ -535,6 +535,11 @@ function Get-DelegationDenyRules($Task, $Context) {
     $rules += $bashGitDenials
     $rules += @($bashGitDenials | ForEach-Object { $_ -replace '^Bash', 'PowerShell' })
 
+    # direct mode promises one process and no teammates. A bare tool-name deny
+    # removes the subagent tool from Claude's context entirely, which the prompt
+    # sentence alone cannot do. The tool is named Agent, not Task.
+    if ($Task.mode -eq 'direct') { $rules += 'Agent' }
+
     # forbiddenPaths is otherwise only prose inside the prompt. Reads leave no
     # trace in any snapshot, so they have to be denied rather than detected.
     foreach ($pattern in @($Task.forbiddenPaths)) {
@@ -1199,6 +1204,32 @@ function Get-ScopeClassification([string[]]$ChangedPaths, $Task, [string]$Worktr
     }
 }
 
+function Get-UnownedWorkstreamPaths([string[]]$ChangedPaths, $Task) {
+    # A filesystem snapshot cannot attribute a write to a particular teammate, so
+    # declared ownership can never be verified per teammate after the fact. What
+    # is checkable is that every in-scope change landed inside exactly one
+    # declared ownedPaths set; anything else means the team edited outside the
+    # ownership it declared.
+    if ($Task.mode -ne 'agent-team') { return @() }
+    $workstreams = @($Task.parallelWorkstreams)
+    if ($workstreams.Count -eq 0) { return @() }
+    $unowned = @()
+    foreach ($path in $ChangedPaths) {
+        $normalized = ([string]$path).Replace('\', '/')
+        $allowed = @($Task.allowedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } |
+            Where-Object { $normalized -like $_ }).Count -gt 0
+        if (-not $allowed) { continue }
+        $owners = 0
+        foreach ($stream in $workstreams) {
+            foreach ($ownedPath in @($stream.ownedPaths)) {
+                if ($normalized -like (([string]$ownedPath).Replace('\', '/'))) { $owners++; break }
+            }
+        }
+        if ($owners -ne 1) { $unowned += $normalized }
+    }
+    return @($unowned | Sort-Object -Unique)
+}
+
 function Get-IgnoreRuleChanges([string[]]$ChangedPaths) {
     return @($ChangedPaths | Where-Object {
         $leaf = (([string]$_) -replace '\\', '/').Split('/')[-1]
@@ -1621,6 +1652,7 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             -Worktree $Context.worktreePath
         $scopeViolations = @($scopeClassification.Violations)
         $ignoredArtifacts = @($scopeClassification.IgnoredArtifacts)
+        $unownedPaths = @(Get-UnownedWorkstreamPaths -ChangedPaths $changedDuringTask -Task $Task)
         $repositoryViolations = @()
         if ($scopeClassification.ProbeFailed) { $repositoryViolations += 'ignore-probe-failed' }
         if (@(Get-IgnoreRuleChanges -ChangedPaths $changedDuringTask).Count -gt 0) {
@@ -1673,6 +1705,7 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             changedDuringTask = @($changedDuringTask)
             scopeViolations = @($scopeViolations)
             ignoredArtifacts = @($ignoredArtifacts)
+            unownedPaths = @($unownedPaths)
             repositoryViolations = @($repositoryViolations)
             rawOutputPath = $process.RawOutputPath
             rawErrorPath = $process.RawErrorPath

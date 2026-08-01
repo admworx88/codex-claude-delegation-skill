@@ -30,3 +30,26 @@ jobs:
       - name: Run macOS test suite
         shell: bash
         run: pwsh -NoProfile -File ./tests/Invoke-ClaudeDelegation.Mac.Tests.ps1
+
+  cli-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PowerShell
+        shell: bash
+        run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            sudo snap install powershell --classic
+          fi
+          pwsh --version
+      - name: Install Claude Code CLI
+        shell: bash
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # Both delegation suites run against a fake claude shim, so they cannot
+      # catch an upstream flag rename. This job checks the real interface.
+      # It skips itself if the CLI could not be installed.
+      - name: Check the Claude CLI contract
+        shell: bash
+        run: pwsh -NoProfile -File ./tests/Claude-CliContract.Tests.ps1
