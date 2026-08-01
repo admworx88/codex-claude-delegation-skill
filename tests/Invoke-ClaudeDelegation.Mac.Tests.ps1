@@ -205,7 +205,6 @@ try {
         acceptanceCriteria = 'SENTINEL_ACCEPTANCE_CRITERION_MAC_E2E'
         requiredVerification = 'SENTINEL_REQUIRED_VERIFICATION_MAC_E2E'
         allowedPaths = 'sentinel-allowed-path-mac-e2e/**'
-        forbiddenPaths = 'sentinel-forbidden-path-mac-e2e/**'
         forbiddenActions = 'SENTINEL_FORBIDDEN_ACTION_MAC_E2E'
         baseBranch = 'sentinel-base-branch-mac-e2e'
         featureBranch = 'sentinel-feature-branch-mac-e2e'
@@ -532,6 +531,27 @@ done
             $_ -ceq '--dangerously-skip-permissions'
         }).Count -eq 1
     ) 'validated Claude execution did not receive exactly one permission-bypass argument'
+
+    # forbiddenPaths must reach argv, unlike the stdin-only fields above: a read
+    # is invisible to every snapshot, so it has to be denied rather than detected.
+    Assert-True (
+        $claudeArguments -ccontains 'Read(sentinel-forbidden-path-mac-e2e/**)'
+    ) 'forbiddenPaths did not become an enforced Read deny rule on native argv'
+    Assert-True (
+        $claudeArguments -ccontains 'Edit(sentinel-forbidden-path-mac-e2e/**)'
+    ) 'forbiddenPaths did not become an enforced Edit deny rule on native argv'
+    Assert-True (
+        $claudeArguments -ccontains 'Read(~/.ssh/**)'
+    ) 'credential deny rules did not reach native argv'
+    Assert-True (
+        $claudeArguments -ccontains '--strict-mcp-config'
+    ) 'the delegated session was allowed to load ambient MCP servers'
+    $expectedCommonDirRule = 'Edit(' + (
+        ConvertTo-PermissionRuleAbsolutePath $context.commonDir
+    ) + '/**)'
+    Assert-True (
+        $claudeArguments -ccontains $expectedCommonDirRule
+    ) "the shared Git common directory was not edit-denied on native argv: $expectedCommonDirRule"
     Assert-True (
         -not (Test-Path -LiteralPath $env:DELEGATION_OPEN_CAPTURE)
     ) 'authenticated delegation opened the owner setup Terminal'

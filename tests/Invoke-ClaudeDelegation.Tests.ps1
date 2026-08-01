@@ -72,6 +72,26 @@ foreach ($field in @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'un
     Assert-True ($schema.required -contains $field) "result schema missing $field"
 }
 
+# Every shipped skill file must appear in the README's install-verification and
+# update integrity lists, or an install that loses it still reports success.
+$SkillRoot = Join-Path $RepoRoot 'delegating-to-claude-code'
+$ReadmeText = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'README.md')
+$shippedSkillFiles = @(
+    Get-ChildItem -LiteralPath $SkillRoot -Recurse -File -Force |
+        Where-Object { $_.Name -ne '.gitkeep' } |
+        ForEach-Object {
+            $_.FullName.Substring($SkillRoot.Length).TrimStart('\', '/').Replace('\', '/')
+        }
+)
+Assert-True ($shippedSkillFiles.Count -ge 4) "skill directory enumeration found too few files: $($shippedSkillFiles -join '|')"
+foreach ($shipped in $shippedSkillFiles) {
+    $posixReference = $shipped
+    $windowsReference = $shipped.Replace('/', '\')
+    Assert-True (
+        $ReadmeText.Contains($posixReference) -or $ReadmeText.Contains($windowsReference)
+    ) "shipped skill file is missing from the README verification and update lists: $shipped"
+}
+
 $Runner = Join-Path $RepoRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1'
 . $Runner -LibraryMode
 
@@ -512,6 +532,59 @@ foreach ($denyPattern in ($expectedGitDenyPatterns | ForEach-Object { $_ -replac
 Assert-True ($directInvocation.arguments -contains '--output-format') 'output-format flag missing'
 Assert-True ($directInvocation.arguments[[Array]::IndexOf([object[]]$directInvocation.arguments, '--output-format') + 1] -eq 'json') 'direct mode output must remain JSON'
 
+Assert-True ((ConvertTo-PermissionRuleAbsolutePath 'C:\Repos\main\.git') -ceq '//c/Repos/main/.git') 'Windows drive paths must normalize to POSIX permission-rule form'
+Assert-True ((ConvertTo-PermissionRuleAbsolutePath '/Users/owner/repo/.git') -ceq '//Users/owner/repo/.git') 'POSIX paths must gain the absolute permission-rule prefix'
+Assert-True ((ConvertTo-PermissionRuleAbsolutePath 'D:/a/b/') -ceq '//d/a/b') 'permission-rule paths must trim separators and lowercase the drive'
+$relativeRuleRejected = $false
+try { ConvertTo-PermissionRuleAbsolutePath 'relative/path' | Out-Null } catch { $relativeRuleRejected = $true }
+Assert-True $relativeRuleRejected 'a relative permission-rule path must be rejected'
+
+# forbiddenPaths is otherwise only prose in the prompt, and a read leaves no
+# trace in any snapshot, so it has to become an enforced deny rule.
+$denyRuleContext = [pscustomobject]@{
+    worktreePath = '/repo/feature'
+    gitDir = '/repo/main/.git/worktrees/feature'
+    commonDir = '/repo/main/.git'
+    branch = 'feature/test'
+    repositoryId = '/repo/main/.git'
+}
+$derivedDenyRules = Get-DelegationDenyRules -Task $direct -Context $denyRuleContext
+foreach ($forbiddenPattern in @($direct.forbiddenPaths)) {
+    Assert-True ($derivedDenyRules -ccontains "Read($forbiddenPattern)") "forbiddenPaths did not produce a Read deny rule: $forbiddenPattern"
+    Assert-True ($derivedDenyRules -ccontains "Edit($forbiddenPattern)") "forbiddenPaths did not produce an Edit deny rule: $forbiddenPattern"
+}
+foreach ($credentialRule in @(
+    'Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Read(~/.claude/.credentials.json)',
+    'Read(//**/.env)', 'Read(//**/id_rsa)'
+)) {
+    Assert-True ($derivedDenyRules -ccontains $credentialRule) "credential deny rule missing: $credentialRule"
+}
+Assert-True ($derivedDenyRules -ccontains 'Edit(//repo/main/.git/**)') 'the shared common directory must be edit-denied so hooks cannot be planted'
+Assert-True ($derivedDenyRules -ccontains 'Edit(//repo/main/.git/worktrees/feature/**)') 'the linked worktree Git directory must be edit-denied'
+# Write(path) and Glob(path) rules are accepted but never matched by Claude
+# Code's file permission checks, so they would be silently useless.
+Assert-True (@($derivedDenyRules | Where-Object { $_ -like 'Write(*' -or $_ -like 'Glob(*' }).Count -eq 0) 'deny rules must not use forms that file permission checks never match'
+Assert-True (@($derivedDenyRules | Group-Object | Where-Object { $_.Count -gt 1 }).Count -eq 0) 'deny rules must not contain duplicates'
+
+$contextualInvocation = New-ClaudeInvocation -Task $direct -SessionId $null -SupportsForwarding $false -Context $denyRuleContext
+$contextualArguments = [string[]]$contextualInvocation.arguments
+Assert-True ($contextualArguments -ccontains '--strict-mcp-config') 'the delegated session must not load ambient MCP servers'
+$settingSourcesIndex = [Array]::IndexOf($contextualArguments, '--setting-sources')
+Assert-True ($settingSourcesIndex -ge 0) 'the delegated session must scope its setting sources'
+Assert-True ($contextualArguments[$settingSourcesIndex + 1] -ceq 'user') 'the worktree must not contribute settings, which can register hooks'
+# Commander stops collecting a variadic option at the next flag, so every deny
+# rule must sit in one uninterrupted run after --disallowedTools.
+$denyFlagIndex = [Array]::IndexOf($contextualArguments, '--disallowedTools')
+Assert-True ($denyFlagIndex -ge 0) '--disallowedTools missing from the contextual invocation'
+$collectedDenyRules = @()
+for ($denyOffset = $denyFlagIndex + 1; $denyOffset -lt $contextualArguments.Count; $denyOffset++) {
+    if ($contextualArguments[$denyOffset].StartsWith('--')) { break }
+    $collectedDenyRules += $contextualArguments[$denyOffset]
+}
+Assert-True (
+    $collectedDenyRules.Count -eq $derivedDenyRules.Count
+) "deny rules were split by an intervening flag: expected $($derivedDenyRules.Count), collected $($collectedDenyRules.Count)"
+
 foreach ($invalidLimit in @(
     [pscustomobject]@{ property = 'maxTurns'; value = 0; message = 'zero maxTurns must be rejected' },
     [pscustomobject]@{ property = 'maxTurns'; value = 1.5; message = 'fractional maxTurns must be rejected' },
@@ -788,6 +861,10 @@ if "%CLAUDE_FAKE_MODE%"=="ref-change" (
   git -C "%CD%" branch delegated-ref
   git -C "%CD%" tag delegated-tag
 )
+if "%CLAUDE_FAKE_MODE%"=="hook-plant" (
+  if not exist "%CD%\..\main\.git\hooks" mkdir "%CD%\..\main\.git\hooks"
+  echo exfiltrate>"%CD%\..\main\.git\hooks\pre-commit"
+)
 if "%CLAUDE_FAKE_MODE%"=="config-change" (
   git -C "%CD%" config --local delegation.fake true
 )
@@ -1010,6 +1087,37 @@ exit /b 0
     $successRawError = Get-Content -Raw -LiteralPath $successRecord.rawErrorPath
     Assert-True ($ledger.primarySessionId -eq 'fake-session') "session ID was not persisted; exit: $($successRecord.exitCode); raw output: $successRawOutput; raw error: $successRawError"
     Assert-True ($successRecord.status -eq 'needs-review') 'Claude completion must require Codex review'
+
+    # A dry run that reports a different invocation than the one that executes is
+    # worse than no dry run: the ledger now holds a session id the real run
+    # resumes, so the inspected argv has to show it.
+    $parityDryRunJson = (& $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude -DryRun | Out-String).Trim()
+    $parityDryRun = $parityDryRunJson | ConvertFrom-Json
+    $parityArguments = [string[]]@($parityDryRun.arguments | ForEach-Object { [string]$_ })
+    Assert-True ($parityArguments -ccontains '--resume') 'dry run omitted the resume the real invocation would perform'
+    $parityResumeIndex = [Array]::IndexOf($parityArguments, '--resume')
+    Assert-True ($parityArguments[$parityResumeIndex + 1] -ceq 'fake-session') 'dry run resumed a different session than the ledger records'
+    Assert-True ($parityDryRun.supportsForwardingSource -ceq 'detected') 'dry run did not probe the real CLI for forwarding support'
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$parityDryRun.resolvedClaudeCommand)) 'dry run did not report the resolved Claude command'
+    $parityMissingDryRun = (& $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand (Join-Path $fixtureRoot 'absent-claude.cmd') -DryRun | Out-String).Trim() | ConvertFrom-Json
+    Assert-True (
+        $parityMissingDryRun.supportsForwardingSource -ceq 'claude-cli-unavailable'
+    ) 'dry run assumed forwarding support when the CLI is unavailable'
+    Assert-True (-not $parityMissingDryRun.supportsForwarding) 'dry run claimed forwarding support without a CLI to probe'
+
+    # A hook planted in the shared common directory runs under the owner account
+    # the next time Codex commits, after acceptance.
+    $env:CLAUDE_FAKE_MODE = 'hook-plant'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $hookRecord = @($ledger.tasks)[-1]
+    Assert-True ($hookRecord.repositoryViolations -contains 'hooks-changed') 'a planted Git hook was not recorded'
+    Assert-True ($hookRecord.status -eq 'rejected') 'a planted Git hook was not rejected'
+    Remove-Item -LiteralPath (Join-Path $mainRepo '.git/hooks/pre-commit') -Force -ErrorAction SilentlyContinue
     Assert-True (Test-Path -LiteralPath $successRecord.rawOutputPath) 'raw output was not captured'
     Assert-True (Test-Path -LiteralPath $successRecord.rawErrorPath) 'raw error was not captured'
     Assert-True (Test-Path -LiteralPath $successRecord.resultPath) 'normalized result was not captured'

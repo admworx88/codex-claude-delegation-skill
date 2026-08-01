@@ -491,7 +491,75 @@ function ConvertTo-AsciiJson([string]$Json) {
     return $builder.ToString()
 }
 
-function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwarding) {
+function ConvertTo-PermissionRuleAbsolutePath([string]$Path) {
+    # Claude Code normalizes rule paths to POSIX form and requires a leading //
+    # for filesystem-absolute patterns. C:\Users\x becomes //c/Users/x.
+    $normalized = ([string]$Path).Replace('\', '/').TrimEnd('/')
+    if ($normalized -match '^([A-Za-z]):(/.*)?$') {
+        return '//' + $Matches[1].ToLowerInvariant() + $Matches[2]
+    }
+    if ($normalized.StartsWith('/')) { return '/' + $normalized }
+    throw "Permission rule path must be absolute: $Path"
+}
+
+function Get-PathDenyRule([string]$Pattern, [string[]]$Tools) {
+    return @($Tools | ForEach-Object { "$_($Pattern)" })
+}
+
+function Get-CredentialDenyRules() {
+    # Absolute and home-relative patterns; the task packet only constrains paths
+    # inside the worktree, and bypass permissions reach the whole account.
+    $readOnlyDenies = @(
+        '//**/.env', '//**/.env.*',
+        '//**/id_rsa', '//**/id_ed25519', '//**/id_ecdsa',
+        '~/.ssh/**', '~/.aws/**', '~/.config/gcloud/**', '~/.kube/**',
+        '~/.gnupg/**', '~/.netrc', '~/.npmrc', '~/.pypirc',
+        '~/.docker/config.json', '~/.claude/.credentials.json'
+    )
+    $rules = @()
+    foreach ($pattern in $readOnlyDenies) {
+        $rules += Get-PathDenyRule -Pattern $pattern -Tools @('Read', 'Edit')
+    }
+    return $rules
+}
+
+function Get-DelegationDenyRules($Task, $Context) {
+    $rules = @()
+
+    $bashGitDenials = @(
+        'Bash(git *)', 'Bash(git.exe *)',
+        'Bash(* git *)', 'Bash(* git.exe *)',
+        'Bash(*\git *)', 'Bash(*\git.exe *)',
+        'Bash(*/git *)', 'Bash(*/git.exe *)'
+    )
+    $rules += $bashGitDenials
+    $rules += @($bashGitDenials | ForEach-Object { $_ -replace '^Bash', 'PowerShell' })
+
+    # forbiddenPaths is otherwise only prose inside the prompt. Reads leave no
+    # trace in any snapshot, so they have to be denied rather than detected.
+    foreach ($pattern in @($Task.forbiddenPaths)) {
+        $rules += Get-PathDenyRule -Pattern (([string]$pattern).Replace('\', '/')) -Tools @('Read', 'Edit')
+    }
+    $rules += Get-CredentialDenyRules
+
+    # A linked worktree keeps its hooks in the common directory, outside every
+    # relative rule. Planting one there survives until Codex commits.
+    if ($null -ne $Context) {
+        foreach ($gitDirectory in @($Context.gitDir, $Context.commonDir)) {
+            if ([string]::IsNullOrWhiteSpace($gitDirectory)) { continue }
+            $rulePath = ConvertTo-PermissionRuleAbsolutePath $gitDirectory
+            $rules += Get-PathDenyRule -Pattern "$rulePath/**" -Tools @('Edit')
+        }
+    }
+
+    $unique = [System.Collections.Generic.List[string]]::new()
+    foreach ($rule in $rules) {
+        if (-not $unique.Contains($rule)) { [void]$unique.Add($rule) }
+    }
+    return [string[]]$unique
+}
+
+function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwarding, $Context) {
     Assert-DelegationPolicy -Task $Task
     $schemaPath = Join-Path (Split-Path -Parent $PSScriptRoot) 'references/result-schema.json'
     $schema = (Get-Content -Raw -LiteralPath $schemaPath).Trim()
@@ -506,14 +574,11 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
     $args = @('-p', '--dangerously-skip-permissions', '--output-format', 'json',
               '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
     $args += '--disallowedTools'
-    $bashGitDenials = @(
-        'Bash(git *)', 'Bash(git.exe *)',
-        'Bash(* git *)', 'Bash(* git.exe *)',
-        'Bash(*\git *)', 'Bash(*\git.exe *)',
-        'Bash(*/git *)', 'Bash(*/git.exe *)'
-    )
-    $args += $bashGitDenials
-    $args += @($bashGitDenials | ForEach-Object { $_ -replace '^Bash', 'PowerShell' })
+    $args += Get-DelegationDenyRules -Task $Task -Context $Context
+    # The worktree's own .claude/settings.json and MCP config are attacker-shaped
+    # input when the delegated repository is not fully trusted: settings files
+    # can register hooks, which are arbitrary shell commands.
+    $args += @('--strict-mcp-config', '--setting-sources', 'user')
 
     $environment = @{}
     $fresh = $Task.mode -eq 'agent-team'
@@ -935,6 +1000,72 @@ function Get-CoreExcludesFileIdentity($Context) {
     return "$value=$(Get-FileIdentity $value)"
 }
 
+function Get-DirectoryContentFingerprint([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return '<missing>' }
+    $entries = @()
+    $prefixLength = ([string]$Path).TrimEnd('\', '/').Length + 1
+    $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+    $pending.Push((Get-Item -LiteralPath $Path -Force))
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($file in $directory.GetFiles()) {
+            $relative = $file.FullName.Substring($prefixLength).Replace('\', '/')
+            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $entries += "$relative=$(Get-ReparseEntryFingerprint -Entry $file)"
+                continue
+            }
+            $entries += "$relative=$(Get-FileIdentity $file.FullName)"
+        }
+        foreach ($child in $directory.GetDirectories()) {
+            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                $relative = $child.FullName.Substring($prefixLength).Replace('\', '/')
+                $entries += "$relative=$(Get-ReparseEntryFingerprint -Entry $child)"
+                continue
+            }
+            $pending.Push($child)
+        }
+    }
+    return (@($entries | Sort-Object) -join "`n")
+}
+
+function Get-CoreHooksPath($Context) {
+    $result = Invoke-DelegationNativeCommand -Command 'git' -Arguments @(
+        '-C', $Context.worktreePath, 'config', '--get', 'core.hooksPath'
+    )
+    if ($result.ExitCode -ne 0) { return $null }
+    $value = $result.StandardOutput.Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+    if ($value.StartsWith('~')) {
+        $profileRoot = [Environment]::GetFolderPath('UserProfile')
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = $env:HOME }
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) { return $value }
+        $value = Join-Path $profileRoot $value.Substring(1).TrimStart('/', '\')
+    }
+    if (-not [System.IO.Path]::IsPathRooted($value)) {
+        $value = Join-Path $Context.worktreePath $value
+    }
+    return $value
+}
+
+function Get-HookFingerprint($Context) {
+    # A linked worktree shares hooks through the common directory, so the
+    # worktree fingerprint never sees them. A planted pre-commit would run under
+    # the owner's account the next time Codex commits, after acceptance.
+    $roots = [ordered]@{
+        common = Join-Path $Context.commonDir 'hooks'
+        worktree = Join-Path $Context.gitDir 'hooks'
+    }
+    $configured = Get-CoreHooksPath -Context $Context
+    $roots['core.hooksPath'] = if ($null -eq $configured) { '<unset>' } else { $configured }
+    $parts = @()
+    foreach ($name in $roots.Keys) {
+        $path = [string]$roots[$name]
+        $fingerprint = if ($path -eq '<unset>') { '<unset>' } else { Get-DirectoryContentFingerprint $path }
+        $parts += "$name=$path`n$fingerprint"
+    }
+    return ($parts -join "`n--`n")
+}
+
 function Get-ExcludeFileFingerprint($Context) {
     # Worktree .gitignore files are covered by the filesystem fingerprint; these
     # exclude sources live outside it and would otherwise let a delegation widen
@@ -963,6 +1094,7 @@ function Get-GitMetadataSnapshot($Context) {
         RepositoryConfig = Get-FileIdentity (Join-Path $Context.commonDir 'config')
         WorktreeConfig = Get-FileIdentity (Join-Path $Context.gitDir 'config.worktree')
         ExcludeFiles = Get-ExcludeFileFingerprint -Context $Context
+        Hooks = Get-HookFingerprint -Context $Context
     }
 }
 
@@ -1433,7 +1565,8 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
         $sessionId = if ($Task.mode -eq 'agent-team') { $null } else { [string]$ledger.primarySessionId }
         $resolvedClaudeCommand = Resolve-ClaudeCommandPath -Command $ClaudeCommand
         $supportsForwarding = Get-ClaudeVersionSupport -ClaudeCommand $resolvedClaudeCommand
-        $invocation = New-ClaudeInvocation -Task $Task -SessionId $sessionId -SupportsForwarding $supportsForwarding
+        $invocation = New-ClaudeInvocation -Task $Task -SessionId $sessionId -SupportsForwarding $supportsForwarding `
+            -Context $Context
         $attempts = @()
         $runToken = [guid]::NewGuid().ToString('N')
         $attemptNumber = 1
@@ -1461,7 +1594,8 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             if ($retryWithoutSession) {
                 $ledger.primarySessionId = $null
                 $ledger | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $State.ledgerPath -Encoding UTF8
-                $invocation = New-ClaudeInvocation -Task $Task -SessionId $null -SupportsForwarding $supportsForwarding
+                $invocation = New-ClaudeInvocation -Task $Task -SessionId $null -SupportsForwarding $supportsForwarding `
+                    -Context $Context
                 $attemptNumber++
             }
         } while ($retryWithoutSession)
@@ -1510,6 +1644,9 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             }
             if ($startingMetadata.ExcludeFiles -cne $endingMetadataProbe.Value.ExcludeFiles) {
                 $repositoryViolations += 'ignore-rules-changed'
+            }
+            if ($startingMetadata.Hooks -cne $endingMetadataProbe.Value.Hooks) {
+                $repositoryViolations += 'hooks-changed'
             }
         }
         if ($endingSiblingsProbe.Success -and
@@ -1577,9 +1714,25 @@ if (-not $LibraryMode) {
     }
     Invoke-Git $context.worktreePath @('show-ref', '--verify', '--quiet', "refs/heads/$($task.baseBranch)") | Out-Null
     $state = Initialize-HandoffState -Context $context -Task $task
-    Read-AndAssertHandoffLedger -LedgerPath $state.ledgerPath -Context $context -Task $task | Out-Null
+    $ledger = Read-AndAssertHandoffLedger -LedgerPath $state.ledgerPath -Context $context -Task $task
     if ($DryRun) {
-        New-ClaudeInvocation -Task $task -SessionId $null -SupportsForwarding $true | ConvertTo-Json -Depth 8
+        # Inspect what will actually run: the same session id and the same
+        # forwarding decision the real invocation would make, not assumptions.
+        $dryRunClaudePath = $null
+        $dryRunForwarding = $false
+        $dryRunForwardingSource = 'claude-cli-unavailable'
+        if (Test-ClaudeAvailable $ClaudeCommand) {
+            $dryRunClaudePath = Resolve-ClaudeCommandPath -Command $ClaudeCommand
+            $dryRunForwarding = Get-ClaudeVersionSupport -ClaudeCommand $dryRunClaudePath
+            $dryRunForwardingSource = 'detected'
+        }
+        $dryRunSessionId = if ($task.mode -eq 'agent-team') { $null } else { [string]$ledger.primarySessionId }
+        $dryRunInvocation = New-ClaudeInvocation -Task $task -SessionId $dryRunSessionId `
+            -SupportsForwarding $dryRunForwarding -Context $context
+        $dryRunInvocation | Add-Member -NotePropertyName resolvedClaudeCommand -NotePropertyValue $dryRunClaudePath
+        $dryRunInvocation | Add-Member -NotePropertyName supportsForwarding -NotePropertyValue $dryRunForwarding
+        $dryRunInvocation | Add-Member -NotePropertyName supportsForwardingSource -NotePropertyValue $dryRunForwardingSource
+        $dryRunInvocation | ConvertTo-Json -Depth 8
         return
     }
     if (-not (Test-ClaudeAvailable $ClaudeCommand)) {

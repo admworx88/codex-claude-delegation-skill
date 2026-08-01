@@ -142,10 +142,25 @@ rerun the same guarded command and packet.
 
 The runner denies Claude Git access in layers: task/prompt prohibitions plus
 Bash and native PowerShell tool denial. It snapshots files, sibling worktrees,
-the index, all refs, repository/worktree configuration, exclude files, HEAD,
-branch, remotes, and status before and after execution. Any forbidden-path,
-out-of-scope, Git-state, sibling-worktree, or probe violation makes the runner
-decision `rejected`.
+the index, all refs, repository/worktree configuration, exclude files, Git
+hooks, HEAD, branch, remotes, and status before and after execution. Any
+forbidden-path, out-of-scope, Git-state, hook, sibling-worktree, or probe
+violation makes the runner decision `rejected`.
+
+`forbiddenPaths` becomes enforced `Read` and `Edit` deny rules, not just prompt
+text, because a read leaves no trace in any snapshot. The runner adds absolute
+deny rules for credential locations outside the worktree (`~/.ssh`, `~/.aws`,
+`~/.claude/.credentials.json`, any `.env`, private keys), edit-denies both Git
+directories so hooks cannot be planted, and scopes the session with
+`--strict-mcp-config` and `--setting-sources user` so the delegated repository's
+own `.claude/settings.json` cannot register hooks, which are arbitrary shell
+commands.
+
+**These deny rules are defense in depth, not a sandbox.** Claude Code applies
+them to its built-in file tools and to file commands it recognizes in Bash, such
+as `cat`, `head`, and `sed`. They do not stop a subprocess that opens files
+itself, such as a Python or Node script. Run the delegation in a container or VM
+when a read of a specific path must be impossible rather than merely denied.
 
 Verification commands legitimately write build and cache output outside
 `allowedPaths`. A changed path that is outside `allowedPaths`, does not match

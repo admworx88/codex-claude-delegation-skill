@@ -127,9 +127,10 @@ Test-Path (Join-Path $destination 'SKILL.md')
 Test-Path (Join-Path $destination 'scripts\Invoke-ClaudeDelegation.ps1')
 Test-Path (Join-Path $destination 'references\task-packet.example.json')
 Test-Path (Join-Path $destination 'references\result-schema.json')
+Test-Path (Join-Path $destination 'agents\openai.yaml')
 ```
 
-Success prints `True` four times.
+Success prints `True` five times.
 
 ### 6. Restart Codex
 
@@ -254,10 +255,12 @@ test -f "$destination/references/task-packet.example.json" \
   && echo "Task-packet example found"
 test -f "$destination/references/result-schema.json" \
   && echo "Result schema found"
+test -f "$destination/agents/openai.yaml" \
+  && echo "Codex interface manifest found"
 ```
 
 Success prints `SKILL.md found`, `Runner found`, `Task-packet example found`,
-and `Result schema found`.
+`Result schema found`, and `Codex interface manifest found`.
 
 ### 8. Restart Codex
 
@@ -407,6 +410,7 @@ Run in PowerShell:
             'scripts\Invoke-ClaudeDelegation.ps1'
             'references\task-packet.example.json'
             'references\result-schema.json'
+            'agents\openai.yaml'
         )
         return -not ($required | Where-Object {
             -not (Test-Path -LiteralPath (Join-Path $Root $_) -PathType Leaf)
@@ -512,6 +516,7 @@ Run in Terminal:
     "scripts/Invoke-ClaudeDelegation.ps1"
     "references/task-packet.example.json"
     "references/result-schema.json"
+    "agents/openai.yaml"
   )
   verify_skill() {
     local root="$1"
@@ -837,9 +842,19 @@ the ledger.
 - Claude may edit only task-packet `allowedPaths` and returns untrusted
   candidate evidence.
 - The runner rejects writes to forbidden paths, out-of-scope writes, Git-state
-  changes, ignore-rule changes, sibling-worktree changes, and unsafe packet or
-  host conditions. Detection is based on before/after file and Git-state
-  snapshots, so it observes what Claude *wrote*, not what it read.
+  changes, ignore-rule changes, Git-hook changes, sibling-worktree changes, and
+  unsafe packet or host conditions. Detection is based on before/after file and
+  Git-state snapshots, so it observes what Claude *wrote*, not what it read.
+- Reads are handled by prevention rather than detection: `forbiddenPaths`
+  becomes `Read` and `Edit` deny rules, and the runner adds absolute denies for
+  credential locations outside the worktree. Claude Code applies these to its
+  built-in file tools and to file commands it recognizes in Bash, but not to a
+  subprocess that opens files itself. Use a container or VM when a read must be
+  impossible rather than denied.
+- The delegated session runs with `--strict-mcp-config` and
+  `--setting-sources user`, so the target repository's own `.claude/settings.json`
+  and MCP configuration do not load. Settings files can register hooks, which
+  are arbitrary shell commands.
 - Build and cache output that Git ignores is recorded as `ignoredArtifacts` for
   review rather than rejected, so a required verification command does not fail
   its own delegation. Anything matching `forbiddenPaths`, any tracked file, and
