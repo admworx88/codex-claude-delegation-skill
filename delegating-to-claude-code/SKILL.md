@@ -156,10 +156,14 @@ forbidden-path, out-of-scope, Git-state, hook, sibling-worktree, or probe
 violation makes the runner decision `rejected`.
 
 `forbiddenPaths` becomes enforced `Read` and `Edit` deny rules, not just prompt
-text, because a read leaves no trace in any snapshot. The runner adds absolute
-deny rules for credential locations outside the worktree (`~/.ssh`, `~/.aws`,
-`~/.claude/.credentials.json`, any `.env`, private keys), edit-denies both Git
-directories so hooks cannot be planted, and scopes the session with
+text, because a read leaves no trace in any snapshot. Each pattern is emitted
+both bare, which carries gitignore depth semantics, and worktree-absolute, since
+the CLI documents rule anchoring only for the rooted form. The runner adds
+absolute deny rules for credential locations outside the worktree (`~/.ssh`,
+`~/.aws`, `~/.claude/.credentials.json`, any `.env`, private keys), edit-denies
+both Git directories so hooks cannot be planted, edit-denies the user Git config
+directory so `~/.config/git/ignore` cannot widen the worktree's ignore set, and
+scopes the session with
 `--strict-mcp-config` and `--setting-sources user` so the delegated repository's
 own `.claude/settings.json` cannot register hooks, which are arbitrary shell
 commands.
@@ -170,15 +174,33 @@ as `cat`, `head`, and `sed`. They do not stop a subprocess that opens files
 itself, such as a Python or Node script. Run the delegation in a container or VM
 when a read of a specific path must be impossible rather than merely denied.
 
+Two deliberate limitations follow from these rules, both chosen so the guard
+stays simple enough to trust:
+
+- The `//**/.env.*` deny also blocks `.env.example` and similar templates. Deny
+  rules cannot express an exception, and narrowing the pattern to an enumerated
+  list of secret-bearing suffixes would miss whatever a project invents next.
+  When a task needs to know the shape of the configuration, put the template's
+  contents in the packet's `context` array rather than relaxing the rule.
+- A `.gitignore` edit can never be delegated: the change records
+  `ignore-rules-changed` and rejects even when `.gitignore` is listed in
+  `allowedPaths`. Distinguishing a benign entry from one that hides an
+  out-of-scope write requires understanding intent, so the runner does not try.
+  Make ignore-rule changes yourself, outside a delegation.
+
 Verification commands legitimately write build and cache output outside
 `allowedPaths`. A changed path that is outside `allowedPaths`, does not match
 `forbiddenPaths`, and is ignored by Git is recorded as `ignoredArtifacts`
 instead of `scopeViolations`; it does not reject the delegation. Three rules
 keep that from becoming a loophole: a `forbiddenPaths` match is always a
-violation regardless of Git's ignore rules, Git never reports a tracked file as
-ignored so tracked out-of-scope edits still reject, and any change to a
-`.gitignore` file or to an exclude file records `ignore-rules-changed` and
-rejects. Read `ignoredArtifacts` during review; the runner does not treat it as
+violation regardless of Git's ignore rules — matched with the same gitignore
+depth semantics the deny rules use, so `.env*` covers `config/.env` — Git never
+reports a tracked file as ignored so tracked out-of-scope edits still reject, and
+any change to a `.gitignore` file or to an exclude file records
+`ignore-rules-changed` and rejects. The exclude fingerprint covers both
+`info/exclude` files, `core.excludesFile`, and the default user excludes file at
+`$XDG_CONFIG_HOME/git/ignore`, which Git honours even when `core.excludesFile` is
+unset. Read `ignoredArtifacts` during review; the runner does not treat it as
 clean, only as not-a-scope-violation.
 
 After a `needs-review` result, Codex must:
@@ -188,15 +210,21 @@ After a `needs-review` result, Codex must:
 2. Confirm every changed path is allowed and no forbidden path changed, and
    review `ignoredArtifacts` for anything that is not ordinary build or cache
    output.
-3. Review correctness, security, deviations, and every acceptance criterion.
-4. Independently rerun the required verification commands; never rely only on
+3. For `agent-team` results, review `unownedPaths`: every entry is an in-scope
+   change that landed outside every declared `ownedPaths` set. The runner records
+   it without rejecting, because a filesystem snapshot cannot attribute a write
+   to a particular teammate, so this list is only enforced by being read here.
+   Treat a non-empty `unownedPaths` as evidence the team worked outside the
+   ownership it declared, and require an explanation before accepting.
+4. Review correctness, security, deviations, and every acceptance criterion.
+5. Independently rerun the required verification commands; never rely only on
    Claude's report.
-5. Record exactly one Codex decision in the ledger:
+6. Record exactly one Codex decision in the ledger:
    - `accepted` only when the diff and independent verification pass;
    - `needs-revision` for safe but incomplete candidate work, followed by a new
      bounded packet run sequentially; or
    - `rejected` for policy, scope, Git-state, unsafe, or unreviewable output.
-6. Only after `accepted`, let Codex commit, push, and integrate the reviewed
+7. Only after `accepted`, let Codex commit, push, and integrate the reviewed
    changes.
 
 ## Prohibit Claude Git actions and preserve rejected state

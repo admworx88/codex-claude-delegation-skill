@@ -553,11 +553,71 @@ foreach ($forbiddenPattern in @($direct.forbiddenPaths)) {
     Assert-True ($derivedDenyRules -ccontains "Read($forbiddenPattern)") "forbiddenPaths did not produce a Read deny rule: $forbiddenPattern"
     Assert-True ($derivedDenyRules -ccontains "Edit($forbiddenPattern)") "forbiddenPaths did not produce an Edit deny rule: $forbiddenPattern"
 }
+# The bare relative form carries the intended gitignore depth semantics, but the
+# CLI documents anchoring only for the rooted form, so the worktree-absolute
+# forms must be emitted too rather than relying on an undocumented reading.
+foreach ($forbiddenPattern in @($direct.forbiddenPaths)) {
+    foreach ($tool in @('Read', 'Edit')) {
+        Assert-True (
+            $derivedDenyRules -ccontains "$tool(//repo/feature/$forbiddenPattern)"
+        ) "forbiddenPaths did not produce a worktree-absolute $tool deny rule: $forbiddenPattern"
+        Assert-True (
+            $derivedDenyRules -ccontains "$tool(//repo/feature/**/$forbiddenPattern)"
+        ) "forbiddenPaths did not produce a depth-matched absolute $tool deny rule: $forbiddenPattern"
+    }
+}
 foreach ($credentialRule in @(
     'Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Read(~/.claude/.credentials.json)',
-    'Read(//**/.env)', 'Read(//**/id_rsa)'
+    'Read(//**/.env)', 'Read(//**/id_rsa)',
+    # A Git credential store, in a skill built around Git; the gh token beside
+    # the gcloud one; and transcripts of the owner's unrelated projects.
+    'Read(~/.git-credentials)', 'Read(~/.config/gh/hosts.yml)',
+    'Read(~/.claude.json)', 'Read(~/.claude/projects/**)'
 )) {
     Assert-True ($derivedDenyRules -ccontains $credentialRule) "credential deny rule missing: $credentialRule"
+}
+# Git honours ~/.config/git/ignore with core.excludesFile unset, so a write here
+# widens the worktree's ignore set from outside every worktree-relative rule.
+$userExcludesRulePath = ConvertTo-PermissionRuleAbsolutePath (Split-Path -Parent (Get-DefaultUserExcludesPath))
+Assert-True (
+    $derivedDenyRules -ccontains "Edit($userExcludesRulePath/**)"
+) "the default user Git config directory must be edit-denied: $userExcludesRulePath"
+
+# Test-ClaudeAvailable gates the dry run, and Resolve-ClaudeCommandPath runs
+# straight after it, so a command the first accepts and the second rejects turns
+# a dry run into a throw. A shell function is exactly that case.
+function claude-availability-probe { 'not an application' }
+Assert-True (
+    -not (Test-ClaudeAvailable 'claude-availability-probe')
+) 'a shell function must not be reported as an available Claude command'
+$availabilityResolveThrew = $false
+try { Resolve-ClaudeCommandPath -Command 'claude-availability-probe' | Out-Null } catch { $availabilityResolveThrew = $true }
+Assert-True $availabilityResolveThrew 'a shell function must still fail to resolve to an executable path'
+Remove-Item -Path Function:\claude-availability-probe -Force
+
+# ... and because `git config --get core.excludesFile` exits 1 whether or not
+# that file exists, only fingerprinting it directly can detect the change.
+$savedXdgConfigHome = $env:XDG_CONFIG_HOME
+$excludesProbeRoot = Join-Path ([System.IO.Path]::GetTempPath()) "delegation-xdg-$([guid]::NewGuid().ToString('N'))"
+try {
+    $env:XDG_CONFIG_HOME = $excludesProbeRoot
+    Assert-True (
+        (Get-DefaultUserExcludesPath) -eq (Join-Path (Join-Path $excludesProbeRoot 'git') 'ignore')
+    ) 'XDG_CONFIG_HOME must redirect the default user excludes path'
+    $beforeExcludes = Get-ExcludeFileFingerprint -Context $denyRuleContext
+    New-Item -ItemType Directory -Force -Path (Join-Path $excludesProbeRoot 'git') | Out-Null
+    Set-Content -LiteralPath (Join-Path $excludesProbeRoot 'git/ignore') -Value 'nested/'
+    $afterExcludes = Get-ExcludeFileFingerprint -Context $denyRuleContext
+    Assert-True (
+        $beforeExcludes -cne $afterExcludes
+    ) 'creating the default user excludes file must change the exclude fingerprint'
+} finally {
+    if ($null -eq $savedXdgConfigHome) {
+        Remove-Item Env:\XDG_CONFIG_HOME -ErrorAction SilentlyContinue
+    } else {
+        $env:XDG_CONFIG_HOME = $savedXdgConfigHome
+    }
+    Remove-Item -LiteralPath $excludesProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 Assert-True ($derivedDenyRules -ccontains 'Edit(//repo/main/.git/**)') 'the shared common directory must be edit-denied so hooks cannot be planted'
 Assert-True ($derivedDenyRules -ccontains 'Edit(//repo/main/.git/worktrees/feature/**)') 'the linked worktree Git directory must be edit-denied'
@@ -1487,6 +1547,47 @@ exit /b 0
     Assert-True ($classification.Violations -contains '.env') 'a forbidden path was laundered into an artifact by .gitignore'
     Assert-True (-not ($classification.IgnoredArtifacts -contains '.env')) 'a forbidden path was classified as an artifact'
     Assert-True (-not $classification.ProbeFailed) 'the ignore probe failed on a healthy worktree'
+
+    # Deny rules read forbiddenPaths with gitignore depth semantics, so detection
+    # has to as well. A root-anchored match let config/.env and app/secrets/key
+    # fall past the forbidden check into the ignore probe, where the .gitignore
+    # entries that every real repository carries for these names filed them as
+    # ordinary build artifacts and downgraded a rejection to needs-review.
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value '.env'
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value 'secrets/'
+    $nestedForbidden = @('config/.env', 'app/secrets/key', 'deep/nested/.env.local')
+    $nestedClassification = Get-ScopeClassification -Worktree $linked -Task $executionTask `
+        -ChangedPaths $nestedForbidden
+    foreach ($nestedPath in $nestedForbidden) {
+        Assert-True (
+            $nestedClassification.Violations -contains $nestedPath
+        ) "a nested forbidden path was not treated as a violation: $nestedPath"
+        Assert-True (
+            -not ($nestedClassification.IgnoredArtifacts -contains $nestedPath)
+        ) "a nested forbidden path was laundered into an artifact: $nestedPath"
+        Assert-True (
+            (Get-ScopeViolations -ChangedPaths @($nestedPath) -Task $executionTask) -contains $nestedPath
+        ) "a nested forbidden path escaped Get-ScopeViolations: $nestedPath"
+    }
+
+    # The depth forms must keep the segment boundary: src/mysecrets is not
+    # covered by secrets/**, and widening forbiddenPaths must never widen
+    # allowedPaths, which stays root-anchored.
+    Assert-True (
+        -not (Test-ForbiddenPathMatch -Path 'src/mysecrets/key' -ForbiddenPatterns @('secrets/**'))
+    ) 'a depth-matched pattern matched across a segment boundary'
+    Assert-True (
+        Test-ForbiddenPathMatch -Path 'src/secrets/key' -ForbiddenPatterns @('secrets/**')
+    ) 'a nested directory pattern was not depth-matched'
+    Assert-True (
+        Test-ForbiddenPathMatch -Path 'sub/.git/config' -ForbiddenPatterns @('.git/**')
+    ) 'a nested Git directory was not depth-matched'
+    Assert-True (
+        Test-ForbiddenPathMatch -Path 'secrets/key' -ForbiddenPatterns @('secrets')
+    ) 'a bare directory pattern did not forbid the paths beneath it'
+    Assert-True (
+        (Get-ScopeViolations -ChangedPaths @('src/parser.ps1') -Task $executionTask).Count -eq 0
+    ) 'an allowed path became a violation after forbidden matching was widened'
 
     # Git never reports a tracked file as ignored, so an out-of-scope edit to a
     # tracked file stays a violation even when an ignore rule matches its name.

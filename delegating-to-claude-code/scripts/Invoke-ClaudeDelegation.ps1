@@ -17,20 +17,26 @@ function Invoke-DelegationNativeCommand([string]$Command, [string[]]$Arguments) 
     $ErrorActionPreference = 'Continue'
     $merged = @(& $Command @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
-    $standardOutput = @()
-    $standardError = @()
+    # Lists, not += : this runs over whole-repository output such as
+    # `git ls-files --stage`, and array append reallocates on every element,
+    # which is quadratic in the number of lines.
+    $standardOutput = [System.Collections.Generic.List[string]]::new()
+    $standardError = [System.Collections.Generic.List[string]]::new()
+    $combined = [System.Collections.Generic.List[string]]::new()
     foreach ($record in $merged) {
+        $text = [string]$record
+        $combined.Add($text)
         if ($record -is [System.Management.Automation.ErrorRecord]) {
-            $standardError += [string]$record
+            $standardError.Add($text)
         } else {
-            $standardOutput += [string]$record
+            $standardOutput.Add($text)
         }
     }
     return [pscustomobject]@{
         ExitCode = $exitCode
         StandardOutput = ($standardOutput -join [Environment]::NewLine)
         StandardError = ($standardError -join [Environment]::NewLine)
-        Combined = (@($merged | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)
+        Combined = ($combined -join [Environment]::NewLine)
     }
 }
 
@@ -514,7 +520,15 @@ function Get-CredentialDenyRules() {
         '//**/id_rsa', '//**/id_ed25519', '//**/id_ecdsa',
         '~/.ssh/**', '~/.aws/**', '~/.config/gcloud/**', '~/.kube/**',
         '~/.gnupg/**', '~/.netrc', '~/.npmrc', '~/.pypirc',
-        '~/.docker/config.json', '~/.claude/.credentials.json'
+        '~/.docker/config.json', '~/.claude/.credentials.json',
+        # Git's own plaintext credential store, in a skill built entirely around
+        # Git, and the GitHub CLI token beside the gcloud one already covered.
+        '~/.git-credentials', '~/.config/git/credentials',
+        '~/.config/gh/hosts.yml', '~/.config/gh/config.yml',
+        # Account state and, in projects/, full transcripts of the owner's work
+        # on unrelated repositories: other people's source code, not this task's.
+        '~/.claude.json', '~/.claude/projects/**', '~/.claude/history/**',
+        '~/.config/claude/**'
     )
     $rules = @()
     foreach ($pattern in $readOnlyDenies) {
@@ -542,10 +556,36 @@ function Get-DelegationDenyRules($Task, $Context) {
 
     # forbiddenPaths is otherwise only prose inside the prompt. Reads leave no
     # trace in any snapshot, so they have to be denied rather than detected.
+    #
+    # Each pattern is emitted twice. The bare relative form carries the intended
+    # gitignore depth semantics, but the docs specify CLI-flag anchoring only for
+    # the rooted form, so where a bare pattern anchors is undocumented. The
+    # worktree-absolute forms are unambiguous and do not depend on that reading.
+    # A deny rule can only ever restrict, so emitting both is free.
+    $worktreeRulePath = $null
+    if ($null -ne $Context -and -not [string]::IsNullOrWhiteSpace($Context.worktreePath)) {
+        $worktreeRulePath = ConvertTo-PermissionRuleAbsolutePath $Context.worktreePath
+    }
     foreach ($pattern in @($Task.forbiddenPaths)) {
-        $rules += Get-PathDenyRule -Pattern (([string]$pattern).Replace('\', '/')) -Tools @('Read', 'Edit')
+        $normalized = ([string]$pattern).Replace('\', '/').TrimStart('/')
+        if ([string]::IsNullOrWhiteSpace($normalized)) { continue }
+        $rules += Get-PathDenyRule -Pattern $normalized -Tools @('Read', 'Edit')
+        if ($null -eq $worktreeRulePath) { continue }
+        $rules += Get-PathDenyRule -Pattern "$worktreeRulePath/$normalized" -Tools @('Read', 'Edit')
+        $rules += Get-PathDenyRule -Pattern "$worktreeRulePath/**/$normalized" -Tools @('Read', 'Edit')
     }
     $rules += Get-CredentialDenyRules
+
+    # Git reads this file even with core.excludesFile unset, so a write here
+    # widens the ignore set for the worktree. Get-ExcludeFileFingerprint detects
+    # it after the fact; this stops the built-in file tools reaching it at all.
+    $userExcludesPath = Get-DefaultUserExcludesPath
+    if (-not [string]::IsNullOrWhiteSpace($userExcludesPath)) {
+        $userGitConfigDirectory = Split-Path -Parent $userExcludesPath
+        $rules += Get-PathDenyRule -Pattern (
+            "$(ConvertTo-PermissionRuleAbsolutePath $userGitConfigDirectory)/**"
+        ) -Tools @('Edit')
+    }
 
     # A linked worktree keeps its hooks in the common directory, outside every
     # relative rule. Planting one there survives until Codex commits.
@@ -606,7 +646,11 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
 }
 
 function Test-ClaudeAvailable([string]$Command) {
-    return $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
+    # Must agree with Resolve-ClaudeCommandPath, which requires an application:
+    # a bare Get-Command also matches a shell function or alias, and every caller
+    # that treats this as "available" immediately resolves a real executable
+    # path. Reporting a function as available turned a dry run into a throw.
+    return $null -ne (Get-Command $Command -CommandType Application -ErrorAction SilentlyContinue)
 }
 
 function Resolve-ClaudeCommandPath([string]$Command) {
@@ -1071,6 +1115,28 @@ function Get-HookFingerprint($Context) {
     return ($parts -join "`n--`n")
 }
 
+function Get-DefaultUserExcludesPath() {
+    # Git honours $XDG_CONFIG_HOME/git/ignore, defaulting to ~/.config/git/ignore,
+    # even when core.excludesFile is unset.
+    $configRoot = $env:XDG_CONFIG_HOME
+    if ([string]::IsNullOrWhiteSpace($configRoot)) {
+        $profileRoot = [Environment]::GetFolderPath('UserProfile')
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) { $profileRoot = $env:HOME }
+        if ([string]::IsNullOrWhiteSpace($profileRoot)) { return $null }
+        $configRoot = Join-Path $profileRoot '.config'
+    }
+    return (Join-Path (Join-Path $configRoot 'git') 'ignore')
+}
+
+function Get-DefaultUserExcludesFileIdentity() {
+    # `git config --get core.excludesFile` exits 1 whether or not this file
+    # exists, so Get-CoreExcludesFileIdentity reports <unset> in both snapshots
+    # and a delegation that creates it widens the ignore set undetected.
+    $path = Get-DefaultUserExcludesPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return '<unresolved>' }
+    return "$path=$(Get-FileIdentity $path)"
+}
+
 function Get-ExcludeFileFingerprint($Context) {
     # Worktree .gitignore files are covered by the filesystem fingerprint; these
     # exclude sources live outside it and would otherwise let a delegation widen
@@ -1079,6 +1145,7 @@ function Get-ExcludeFileFingerprint($Context) {
         "common=$(Get-FileIdentity (Join-Path $Context.commonDir 'info/exclude'))"
         "worktree=$(Get-FileIdentity (Join-Path $Context.gitDir 'info/exclude'))"
         "core.excludesFile=$(Get-CoreExcludesFileIdentity -Context $Context)"
+        "defaultUserExcludes=$(Get-DefaultUserExcludesFileIdentity)"
     ) -join '|')
 }
 
@@ -1119,11 +1186,50 @@ function Get-SiblingFingerprintProbe($Context) {
     }
 }
 
+function Get-ForbiddenMatchForm([string]$Pattern) {
+    # Claude Code reads deny-rule patterns with gitignore semantics, where a
+    # pattern that is not rooted matches at any depth. PowerShell -like is always
+    # root-anchored, so detection reading the same pattern literally is strictly
+    # weaker than the deny rule built from it: `.env*` would stop matching at
+    # `config/.env`. That gap let a nested forbidden path fall through to the
+    # ignore probe and be filed as an ordinary build artifact, which is the one
+    # outcome Get-ScopeClassification exists to prevent. Prevention and detection
+    # have to read a pattern the same way, so expand the depth-matching forms
+    # here and use this matcher everywhere forbiddenPaths is evaluated.
+    $normalized = ([string]$Pattern).Replace('\', '/').Trim()
+    if ([string]::IsNullOrWhiteSpace($normalized)) { return @() }
+    $normalized = $normalized.TrimStart('/')
+    if ($normalized.EndsWith('/')) { $normalized = "$normalized**" }
+    if ([string]::IsNullOrWhiteSpace($normalized)) { return @() }
+
+    $forms = [System.Collections.Generic.List[string]]::new()
+    [void]$forms.Add($normalized)
+    # A bare directory name forbids everything beneath it, as gitignore does.
+    if (-not $normalized.EndsWith('*')) { [void]$forms.Add("$normalized/**") }
+    # The leading */ keeps the segment boundary, so secrets/** does not match
+    # src/mysecrets/key while still matching src/secrets/key.
+    foreach ($form in @($forms.ToArray())) { [void]$forms.Add("*/$form") }
+    return [string[]]$forms
+}
+
+function Test-ForbiddenPathMatch([string]$Path, $ForbiddenPatterns) {
+    $normalized = ([string]$Path).Replace('\', '/')
+    foreach ($pattern in @($ForbiddenPatterns)) {
+        foreach ($form in @(Get-ForbiddenMatchForm -Pattern $pattern)) {
+            if ($normalized -like $form) { return $true }
+        }
+    }
+    return $false
+}
+
 function Get-ScopeViolations([string[]]$ChangedPaths, $Task) {
     $violations = @()
     foreach ($path in $ChangedPaths) {
         $normalized = $path.Replace('\', '/')
-        $forbidden = @($Task.forbiddenPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Where-Object { $normalized -like $_ }).Count -gt 0
+        # allowedPaths stays root-anchored on purpose: widening it would admit
+        # paths the packet never authorized, while widening forbiddenPaths can
+        # only ever reject more.
+        $forbidden = Test-ForbiddenPathMatch -Path $normalized -ForbiddenPatterns $Task.forbiddenPaths
         $allowed = @($Task.allowedPaths | ForEach-Object { ([string]$_).Replace('\', '/') } | Where-Object { $normalized -like $_ }).Count -gt 0
         if ($forbidden -or -not $allowed) { $violations += $normalized }
     }
@@ -1164,11 +1270,14 @@ function Get-ScopeClassification([string[]]$ChangedPaths, $Task, [string]$Worktr
     }
 
     # A forbidden path is never an artifact, whatever .gitignore says about it.
-    $forbiddenPatterns = @($Task.forbiddenPaths | ForEach-Object { ([string]$_).Replace('\', '/') })
+    # This must use the same matcher as the deny rules: .gitignore files almost
+    # always ignore .env, *.key and secrets/, which are exactly the names every
+    # packet is required to forbid, so a weaker match here softens the decision
+    # precisely on the most sensitive files in the tree.
     $violations = @()
     $candidates = @()
     foreach ($path in $patternViolations) {
-        if (@($forbiddenPatterns | Where-Object { $path -like $_ }).Count -gt 0) {
+        if (Test-ForbiddenPathMatch -Path $path -ForbiddenPatterns $Task.forbiddenPaths) {
             $violations += $path
         } else {
             $candidates += $path
@@ -1225,6 +1334,11 @@ function Get-UnownedWorkstreamPaths([string[]]$ChangedPaths, $Task) {
                 if ($normalized -like (([string]$ownedPath).Replace('\', '/'))) { $owners++; break }
             }
         }
+        # Assert-DelegationPolicy rejects overlapping ownership before Claude
+        # runs, so owners > 1 is unreachable for any packet that got this far.
+        # The check stays -ne 1 rather than -eq 0 so that a future relaxation of
+        # that policy surfaces here instead of silently accepting a path two
+        # teammates both claim.
         if ($owners -ne 1) { $unowned += $normalized }
     }
     return @($unowned | Sort-Object -Unique)

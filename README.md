@@ -866,7 +866,13 @@ the ledger.
 - Build and cache output that Git ignores is recorded as `ignoredArtifacts` for
   review rather than rejected, so a required verification command does not fail
   its own delegation. Anything matching `forbiddenPaths`, any tracked file, and
-  any change to a `.gitignore` or exclude file still rejects.
+  any change to a `.gitignore` or exclude file still rejects. `forbiddenPaths` is
+  matched with the same gitignore depth semantics the deny rules use, so a nested
+  `config/.env` cannot be reclassified as an artifact by an ordinary ignore rule.
+- For `agent-team` mode, in-scope changes that landed outside every declared
+  `ownedPaths` set are recorded as `unownedPaths`. This is advisory and does not
+  reject: a filesystem snapshot cannot attribute a write to a teammate. It has
+  effect only if a reviewer reads it, so the review checklist requires that.
 - Claude is denied Git tool access and any commit, push, pull, merge, rebase,
   reset, checkout, branch switch, stash, tag, remote edit, or worktree creation
   is detected by the before/after snapshots. Denial is enforced by Claude Code
