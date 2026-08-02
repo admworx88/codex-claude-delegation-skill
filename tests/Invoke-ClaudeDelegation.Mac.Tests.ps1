@@ -205,7 +205,6 @@ try {
         acceptanceCriteria = 'SENTINEL_ACCEPTANCE_CRITERION_MAC_E2E'
         requiredVerification = 'SENTINEL_REQUIRED_VERIFICATION_MAC_E2E'
         allowedPaths = 'sentinel-allowed-path-mac-e2e/**'
-        forbiddenPaths = 'sentinel-forbidden-path-mac-e2e/**'
         forbiddenActions = 'SENTINEL_FORBIDDEN_ACTION_MAC_E2E'
         baseBranch = 'sentinel-base-branch-mac-e2e'
         featureBranch = 'sentinel-feature-branch-mac-e2e'
@@ -447,7 +446,33 @@ done
     ) 'stored result did not satisfy the result contract'
     Assert-StringArrayShape -Value $record.changedDuringTask -Name 'changedDuringTask'
     Assert-StringArrayShape -Value $record.scopeViolations -Name 'scopeViolations'
+    Assert-StringArrayShape -Value $record.ignoredArtifacts -Name 'ignoredArtifacts'
     Assert-StringArrayShape -Value $record.repositoryViolations -Name 'repositoryViolations'
+    Assert-True (@($record.ignoredArtifacts).Count -eq 0) 'allowed edit produced a spurious ignored artifact'
+
+    Set-Content -LiteralPath (Join-Path $linkedWorktree '.gitignore') -Value 'build/' -NoNewline
+    New-Item -ItemType Directory -Force -Path (Join-Path $linkedWorktree 'build') | Out-Null
+    Set-Content -LiteralPath (Join-Path $linkedWorktree 'build/output.txt') -Value 'artifact'
+    $macClassification = Get-ScopeClassification -Worktree $linkedWorktree -Task $validatedTask `
+        -ChangedPaths @('build/output.txt', 'not-ignored.txt')
+    Assert-True (
+        $macClassification.IgnoredArtifacts -ccontains 'build/output.txt'
+    ) 'a git-ignored byproduct was not classified as an artifact on macOS'
+    Assert-True (
+        $macClassification.Violations -ccontains 'not-ignored.txt'
+    ) 'an untracked out-of-scope file escaped the macOS scope check'
+    Assert-True (-not $macClassification.ProbeFailed) 'the macOS ignore probe failed on a healthy worktree'
+
+    # Set-Content -NoNewline left the rule unterminated; the handoff rule must not
+    # be glued onto it.
+    Add-HandoffIgnoreRule -IgnorePath (Join-Path $linkedWorktree '.gitignore')
+    $macIgnoreRules = @(
+        [System.IO.File]::ReadAllText((Join-Path $linkedWorktree '.gitignore')) -split "`r?`n" |
+            Where-Object { $_ -ne '' }
+    )
+    Assert-True ($macIgnoreRules -ccontains 'build/') 'appending the handoff rule rewrote the final macOS .gitignore entry'
+    Assert-True ($macIgnoreRules -ccontains '.codex/claude-handoff/') 'the handoff ignore rule was not appended on macOS'
+    Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('packages/api/.gitignore')).Count -eq 1) 'a nested .gitignore change was not detected on macOS'
 
     $afterMetadata = Get-GitMetadataSnapshot -Context $context
     $afterSiblings = Get-SiblingWorktreeFingerprint -Context $context
@@ -459,7 +484,8 @@ done
         'IndexFile',
         'Refs',
         'RepositoryConfig',
-        'WorktreeConfig'
+        'WorktreeConfig',
+        'ExcludeFiles'
     )) {
         Assert-True (
             $beforeMetadata.$property -ceq $afterMetadata.$property
@@ -505,6 +531,27 @@ done
             $_ -ceq '--dangerously-skip-permissions'
         }).Count -eq 1
     ) 'validated Claude execution did not receive exactly one permission-bypass argument'
+
+    # forbiddenPaths must reach argv, unlike the stdin-only fields above: a read
+    # is invisible to every snapshot, so it has to be denied rather than detected.
+    Assert-True (
+        $claudeArguments -ccontains 'Read(sentinel-forbidden-path-mac-e2e/**)'
+    ) 'forbiddenPaths did not become an enforced Read deny rule on native argv'
+    Assert-True (
+        $claudeArguments -ccontains 'Edit(sentinel-forbidden-path-mac-e2e/**)'
+    ) 'forbiddenPaths did not become an enforced Edit deny rule on native argv'
+    Assert-True (
+        $claudeArguments -ccontains 'Read(~/.ssh/**)'
+    ) 'credential deny rules did not reach native argv'
+    Assert-True (
+        $claudeArguments -ccontains '--strict-mcp-config'
+    ) 'the delegated session was allowed to load ambient MCP servers'
+    $expectedCommonDirRule = 'Edit(' + (
+        ConvertTo-PermissionRuleAbsolutePath $context.commonDir
+    ) + '/**)'
+    Assert-True (
+        $claudeArguments -ccontains $expectedCommonDirRule
+    ) "the shared Git common directory was not edit-denied on native argv: $expectedCommonDirRule"
     Assert-True (
         -not (Test-Path -LiteralPath $env:DELEGATION_OPEN_CAPTURE)
     ) 'authenticated delegation opened the owner setup Terminal'

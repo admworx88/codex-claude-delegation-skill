@@ -72,6 +72,26 @@ foreach ($field in @('taskId', 'status', 'summary', 'changedFiles', 'tests', 'un
     Assert-True ($schema.required -contains $field) "result schema missing $field"
 }
 
+# Every shipped skill file must appear in the README's install-verification and
+# update integrity lists, or an install that loses it still reports success.
+$SkillRoot = Join-Path $RepoRoot 'delegating-to-claude-code'
+$ReadmeText = Get-Content -Raw -LiteralPath (Join-Path $RepoRoot 'README.md')
+$shippedSkillFiles = @(
+    Get-ChildItem -LiteralPath $SkillRoot -Recurse -File -Force |
+        Where-Object { $_.Name -ne '.gitkeep' } |
+        ForEach-Object {
+            $_.FullName.Substring($SkillRoot.Length).TrimStart('\', '/').Replace('\', '/')
+        }
+)
+Assert-True ($shippedSkillFiles.Count -ge 4) "skill directory enumeration found too few files: $($shippedSkillFiles -join '|')"
+foreach ($shipped in $shippedSkillFiles) {
+    $posixReference = $shipped
+    $windowsReference = $shipped.Replace('/', '\')
+    Assert-True (
+        $ReadmeText.Contains($posixReference) -or $ReadmeText.Contains($windowsReference)
+    ) "shipped skill file is missing from the README verification and update lists: $shipped"
+}
+
 $Runner = Join-Path $RepoRoot 'delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1'
 . $Runner -LibraryMode
 
@@ -87,6 +107,94 @@ Assert-True (
 Assert-True (
     (Remove-TrailingPathSeparatorsExceptRoot '\\server\share\') -ceq '\\server\share\'
 ) 'UNC roots must preserve their trailing root separator'
+
+$nativeCaptureRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'claude-delegation-native-capture-' + [guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $nativeCaptureRoot -Force | Out-Null
+    $noisyCommand = Join-Path $nativeCaptureRoot 'noisy.cmd'
+    @'
+@echo off
+echo advisory text 1>&2
+echo standard output
+exit /b 0
+'@ | Set-Content -LiteralPath $noisyCommand -Encoding ASCII
+
+    # $ErrorActionPreference is 'Stop' for this whole suite, which is exactly the
+    # condition under which Windows PowerShell 5.1 turns native stderr into a
+    # terminating error. Git emits advisory stderr on successful commands.
+    $noisyResult = Invoke-DelegationNativeCommand -Command $noisyCommand -Arguments @()
+    Assert-True ($noisyResult.ExitCode -eq 0) 'stderr on a successful native command changed its reported exit code'
+    Assert-True ($noisyResult.StandardOutput.Trim() -ceq 'standard output') "native stdout was contaminated by stderr: $($noisyResult.StandardOutput)"
+    Assert-True ($noisyResult.StandardError -match 'advisory text') 'native stderr was not captured for diagnostics'
+    Assert-True ($noisyResult.Combined -match 'advisory text') 'combined native output dropped stderr'
+
+    $failingCommand = Join-Path $nativeCaptureRoot 'failing.cmd'
+    @'
+@echo off
+echo fatal detail 1>&2
+exit /b 3
+'@ | Set-Content -LiteralPath $failingCommand -Encoding ASCII
+    $failingResult = Invoke-DelegationNativeCommand -Command $failingCommand -Arguments @()
+    Assert-True ($failingResult.ExitCode -eq 3) 'a failing native command did not report its exit code'
+    Assert-True ($failingResult.Combined -match 'fatal detail') 'a failing native command lost its stderr detail'
+} finally {
+    if (Test-Path -LiteralPath $nativeCaptureRoot) {
+        Remove-Item -LiteralPath $nativeCaptureRoot -Recurse -Force
+    }
+}
+
+$ignoreRuleRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'claude-delegation-ignore-rule-' + [guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $ignoreRuleRoot -Force | Out-Null
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    $unterminatedPath = Join-Path $ignoreRuleRoot 'unterminated.gitignore'
+    [System.IO.File]::WriteAllText($unterminatedPath, "node_modules`nbuild/output", $utf8NoBom)
+    Add-HandoffIgnoreRule -IgnorePath $unterminatedPath
+    $unterminatedRules = @([System.IO.File]::ReadAllText($unterminatedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($unterminatedRules -ccontains 'build/output') "appending the handoff rule rewrote the final existing entry: $($unterminatedRules -join '|')"
+    Assert-True ($unterminatedRules -ccontains '.codex/claude-handoff/') 'the handoff ignore rule was not appended'
+    Assert-True ($unterminatedRules.Count -eq 3) "unexpected .gitignore contents: $($unterminatedRules -join '|')"
+
+    Add-HandoffIgnoreRule -IgnorePath $unterminatedPath
+    $repeatedRules = @([System.IO.File]::ReadAllText($unterminatedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($repeatedRules.Count -eq 3) 'the handoff ignore rule was appended twice'
+
+    $rootedPath = Join-Path $ignoreRuleRoot 'rooted.gitignore'
+    [System.IO.File]::WriteAllText($rootedPath, "/.codex/claude-handoff/`n", $utf8NoBom)
+    Add-HandoffIgnoreRule -IgnorePath $rootedPath
+    $rootedRules = @([System.IO.File]::ReadAllText($rootedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($rootedRules.Count -eq 1) "an equivalent rooted handoff rule was duplicated: $($rootedRules -join '|')"
+
+    $unslashedPath = Join-Path $ignoreRuleRoot 'unslashed.gitignore'
+    [System.IO.File]::WriteAllText($unslashedPath, ".codex/claude-handoff`n", $utf8NoBom)
+    Add-HandoffIgnoreRule -IgnorePath $unslashedPath
+    $unslashedRules = @([System.IO.File]::ReadAllText($unslashedPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($unslashedRules.Count -eq 1) "an equivalent unslashed handoff rule was duplicated: $($unslashedRules -join '|')"
+
+    $createdPath = Join-Path $ignoreRuleRoot 'created.gitignore'
+    Add-HandoffIgnoreRule -IgnorePath $createdPath
+    $createdRules = @([System.IO.File]::ReadAllText($createdPath) -split "`r?`n" |
+        Where-Object { $_ -ne '' })
+    Assert-True ($createdRules -ccontains '.codex/claude-handoff/') 'a missing .gitignore was not created with the handoff rule'
+} finally {
+    if (Test-Path -LiteralPath $ignoreRuleRoot) {
+        Remove-Item -LiteralPath $ignoreRuleRoot -Recurse -Force
+    }
+}
+
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('src/app.ts')).Count -eq 0) 'an ordinary change was reported as an ignore-rule change'
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('.gitignore')).Count -eq 1) 'a root .gitignore change was not detected'
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('packages/api/.gitignore')).Count -eq 1) 'a nested .gitignore change was not detected'
+Assert-True (@(Get-IgnoreRuleChanges -ChangedPaths @('src\nested\.gitignore')).Count -eq 1) 'a Windows-separated .gitignore change was not detected'
 
 Assert-True ((Get-PathStringComparison -Platform 'Windows') -eq [System.StringComparison]::OrdinalIgnoreCase) 'Windows paths must use ordinal case-insensitive comparison'
 Assert-True ((Get-PathStringComparison -Platform 'MacOS') -eq [System.StringComparison]::Ordinal) 'macOS paths must use ordinal case-sensitive comparison'
@@ -424,6 +532,128 @@ foreach ($denyPattern in ($expectedGitDenyPatterns | ForEach-Object { $_ -replac
 Assert-True ($directInvocation.arguments -contains '--output-format') 'output-format flag missing'
 Assert-True ($directInvocation.arguments[[Array]::IndexOf([object[]]$directInvocation.arguments, '--output-format') + 1] -eq 'json') 'direct mode output must remain JSON'
 
+Assert-True ((ConvertTo-PermissionRuleAbsolutePath 'C:\Repos\main\.git') -ceq '//c/Repos/main/.git') 'Windows drive paths must normalize to POSIX permission-rule form'
+Assert-True ((ConvertTo-PermissionRuleAbsolutePath '/Users/owner/repo/.git') -ceq '//Users/owner/repo/.git') 'POSIX paths must gain the absolute permission-rule prefix'
+Assert-True ((ConvertTo-PermissionRuleAbsolutePath 'D:/a/b/') -ceq '//d/a/b') 'permission-rule paths must trim separators and lowercase the drive'
+$relativeRuleRejected = $false
+try { ConvertTo-PermissionRuleAbsolutePath 'relative/path' | Out-Null } catch { $relativeRuleRejected = $true }
+Assert-True $relativeRuleRejected 'a relative permission-rule path must be rejected'
+
+# forbiddenPaths is otherwise only prose in the prompt, and a read leaves no
+# trace in any snapshot, so it has to become an enforced deny rule.
+$denyRuleContext = [pscustomobject]@{
+    worktreePath = '/repo/feature'
+    gitDir = '/repo/main/.git/worktrees/feature'
+    commonDir = '/repo/main/.git'
+    branch = 'feature/test'
+    repositoryId = '/repo/main/.git'
+}
+$derivedDenyRules = Get-DelegationDenyRules -Task $direct -Context $denyRuleContext
+foreach ($forbiddenPattern in @($direct.forbiddenPaths)) {
+    Assert-True ($derivedDenyRules -ccontains "Read($forbiddenPattern)") "forbiddenPaths did not produce a Read deny rule: $forbiddenPattern"
+    Assert-True ($derivedDenyRules -ccontains "Edit($forbiddenPattern)") "forbiddenPaths did not produce an Edit deny rule: $forbiddenPattern"
+}
+# The bare relative form carries the intended gitignore depth semantics, but the
+# CLI documents anchoring only for the rooted form, so the worktree-absolute
+# forms must be emitted too rather than relying on an undocumented reading.
+foreach ($forbiddenPattern in @($direct.forbiddenPaths)) {
+    foreach ($tool in @('Read', 'Edit')) {
+        Assert-True (
+            $derivedDenyRules -ccontains "$tool(//repo/feature/$forbiddenPattern)"
+        ) "forbiddenPaths did not produce a worktree-absolute $tool deny rule: $forbiddenPattern"
+        Assert-True (
+            $derivedDenyRules -ccontains "$tool(//repo/feature/**/$forbiddenPattern)"
+        ) "forbiddenPaths did not produce a depth-matched absolute $tool deny rule: $forbiddenPattern"
+    }
+}
+foreach ($credentialRule in @(
+    'Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Read(~/.claude/.credentials.json)',
+    'Read(//**/.env)', 'Read(//**/id_rsa)',
+    # A Git credential store, in a skill built around Git; the gh token beside
+    # the gcloud one; and transcripts of the owner's unrelated projects.
+    'Read(~/.git-credentials)', 'Read(~/.config/gh/hosts.yml)',
+    'Read(~/.claude.json)', 'Read(~/.claude/projects/**)'
+)) {
+    Assert-True ($derivedDenyRules -ccontains $credentialRule) "credential deny rule missing: $credentialRule"
+}
+# Git honours ~/.config/git/ignore with core.excludesFile unset, so a write here
+# widens the worktree's ignore set from outside every worktree-relative rule.
+$userExcludesRulePath = ConvertTo-PermissionRuleAbsolutePath (Split-Path -Parent (Get-DefaultUserExcludesPath))
+Assert-True (
+    $derivedDenyRules -ccontains "Edit($userExcludesRulePath/**)"
+) "the default user Git config directory must be edit-denied: $userExcludesRulePath"
+
+# Test-ClaudeAvailable gates the dry run, and Resolve-ClaudeCommandPath runs
+# straight after it, so a command the first accepts and the second rejects turns
+# a dry run into a throw. A shell function is exactly that case.
+function claude-availability-probe { 'not an application' }
+Assert-True (
+    -not (Test-ClaudeAvailable 'claude-availability-probe')
+) 'a shell function must not be reported as an available Claude command'
+$availabilityResolveThrew = $false
+try { Resolve-ClaudeCommandPath -Command 'claude-availability-probe' | Out-Null } catch { $availabilityResolveThrew = $true }
+Assert-True $availabilityResolveThrew 'a shell function must still fail to resolve to an executable path'
+Remove-Item -Path Function:\claude-availability-probe -Force
+
+# ... and because `git config --get core.excludesFile` exits 1 whether or not
+# that file exists, only fingerprinting it directly can detect the change.
+$savedXdgConfigHome = $env:XDG_CONFIG_HOME
+$excludesProbeRoot = Join-Path ([System.IO.Path]::GetTempPath()) "delegation-xdg-$([guid]::NewGuid().ToString('N'))"
+try {
+    $env:XDG_CONFIG_HOME = $excludesProbeRoot
+    Assert-True (
+        (Get-DefaultUserExcludesPath) -eq (Join-Path (Join-Path $excludesProbeRoot 'git') 'ignore')
+    ) 'XDG_CONFIG_HOME must redirect the default user excludes path'
+    $beforeExcludes = Get-ExcludeFileFingerprint -Context $denyRuleContext
+    New-Item -ItemType Directory -Force -Path (Join-Path $excludesProbeRoot 'git') | Out-Null
+    Set-Content -LiteralPath (Join-Path $excludesProbeRoot 'git/ignore') -Value 'nested/'
+    $afterExcludes = Get-ExcludeFileFingerprint -Context $denyRuleContext
+    Assert-True (
+        $beforeExcludes -cne $afterExcludes
+    ) 'creating the default user excludes file must change the exclude fingerprint'
+} finally {
+    if ($null -eq $savedXdgConfigHome) {
+        Remove-Item Env:\XDG_CONFIG_HOME -ErrorAction SilentlyContinue
+    } else {
+        $env:XDG_CONFIG_HOME = $savedXdgConfigHome
+    }
+    Remove-Item -LiteralPath $excludesProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+Assert-True ($derivedDenyRules -ccontains 'Edit(//repo/main/.git/**)') 'the shared common directory must be edit-denied so hooks cannot be planted'
+Assert-True ($derivedDenyRules -ccontains 'Edit(//repo/main/.git/worktrees/feature/**)') 'the linked worktree Git directory must be edit-denied'
+# Write(path) and Glob(path) rules are accepted but never matched by Claude
+# Code's file permission checks, so they would be silently useless.
+Assert-True (@($derivedDenyRules | Where-Object { $_ -like 'Write(*' -or $_ -like 'Glob(*' }).Count -eq 0) 'deny rules must not use forms that file permission checks never match'
+Assert-True (@($derivedDenyRules | Group-Object | Where-Object { $_.Count -gt 1 }).Count -eq 0) 'deny rules must not contain duplicates'
+
+$contextualInvocation = New-ClaudeInvocation -Task $direct -SessionId $null -SupportsForwarding $false -Context $denyRuleContext
+$contextualArguments = [string[]]$contextualInvocation.arguments
+Assert-True ($contextualArguments -ccontains '--strict-mcp-config') 'the delegated session must not load ambient MCP servers'
+$settingSourcesIndex = [Array]::IndexOf($contextualArguments, '--setting-sources')
+Assert-True ($settingSourcesIndex -ge 0) 'the delegated session must scope its setting sources'
+Assert-True ($contextualArguments[$settingSourcesIndex + 1] -ceq 'user') 'the worktree must not contribute settings, which can register hooks'
+# Commander stops collecting a variadic option at the next flag, so every deny
+# rule must sit in one uninterrupted run after --disallowedTools.
+$denyFlagIndex = [Array]::IndexOf($contextualArguments, '--disallowedTools')
+Assert-True ($denyFlagIndex -ge 0) '--disallowedTools missing from the contextual invocation'
+$collectedDenyRules = @()
+for ($denyOffset = $denyFlagIndex + 1; $denyOffset -lt $contextualArguments.Count; $denyOffset++) {
+    if ($contextualArguments[$denyOffset].StartsWith('--')) { break }
+    $collectedDenyRules += $contextualArguments[$denyOffset]
+}
+Assert-True (
+    $collectedDenyRules.Count -eq $derivedDenyRules.Count
+) "deny rules were split by an intervening flag: expected $($derivedDenyRules.Count), collected $($collectedDenyRules.Count)"
+
+# direct mode promises no subagents. The subagent tool is named Agent; a rule
+# naming a tool that does not exist would silently enforce nothing.
+Assert-True ($derivedDenyRules -ccontains 'Agent') 'direct mode did not deny the subagent tool'
+$subagentModeTask = $direct | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$subagentModeTask.mode = 'subagents'
+$subagentDenyRules = Get-DelegationDenyRules -Task $subagentModeTask -Context $denyRuleContext
+Assert-True (-not ($subagentDenyRules -ccontains 'Agent')) 'subagents mode must keep the subagent tool available'
+Assert-True (@($subagentDenyRules | Where-Object { $_ -like 'Read(*' }).Count -gt 0) 'subagents mode lost its path deny rules'
+
 foreach ($invalidLimit in @(
     [pscustomobject]@{ property = 'maxTurns'; value = 0; message = 'zero maxTurns must be rejected' },
     [pscustomobject]@{ property = 'maxTurns'; value = 1.5; message = 'fractional maxTurns must be rejected' },
@@ -485,6 +715,35 @@ Assert-True ($teamInvocation.freshSession) 'team mode must use a fresh session'
 Assert-True ($teamInvocation.environment['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS'] -eq '1') 'team env missing'
 Assert-True ($teamInvocation.arguments -contains '--forward-subagent-text') 'stream forwarding missing'
 Assert-True (-not ($teamInvocation.arguments -contains '--resume')) 'team mode must not resume a prior session'
+Assert-True (-not ((Get-DelegationDenyRules -Task $team -Context $null) -ccontains 'Agent')) 'agent-team mode must keep the subagent tool available'
+
+# A filesystem snapshot cannot attribute a write to one teammate, so declared
+# ownership is unverifiable per teammate. What is checkable is that every
+# in-scope change landed in exactly one declared ownedPaths set.
+Assert-True (
+    @(Get-UnownedWorkstreamPaths -ChangedPaths @('src/api/routes.ts', 'src/ui/app.tsx') -Task $team).Count -eq 0
+) 'changes inside a single declared owner were reported as unowned'
+$teamUnowned = Get-UnownedWorkstreamPaths -Task $team -ChangedPaths @(
+    'src/api/routes.ts', 'src/shared/config.ts', 'docs/readme.md'
+)
+Assert-True (-not ($teamUnowned -contains 'src/api/routes.ts')) 'an owned path was reported as unowned'
+Assert-True (-not ($teamUnowned -contains 'docs/readme.md')) 'an out-of-scope path belongs to the scope check, not the ownership check'
+$teamWideAllow = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$teamWideAllow.allowedPaths = @('src/**')
+Assert-True (
+    (Get-UnownedWorkstreamPaths -Task $teamWideAllow -ChangedPaths @('src/shared/config.ts')) -contains 'src/shared/config.ts'
+) 'an in-scope change owned by no workstream was not reported'
+$teamDoubleOwned = $team | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+$teamDoubleOwned.parallelWorkstreams = @(
+    [pscustomobject]@{ name='api'; ownedPaths=@('src/api/**') },
+    [pscustomobject]@{ name='ui'; ownedPaths=@('src/api/**') }
+)
+Assert-True (
+    (Get-UnownedWorkstreamPaths -Task $teamDoubleOwned -ChangedPaths @('src/api/routes.ts')) -contains 'src/api/routes.ts'
+) 'a change claimed by two workstreams was not reported'
+Assert-True (
+    @(Get-UnownedWorkstreamPaths -ChangedPaths @('src/parser.ps1') -Task $direct).Count -eq 0
+) 'the ownership check must not apply outside agent-team mode'
 Assert-True (Test-ForwardSubagentSupport -VersionText '2.1.211 (Claude Code)') 'supported forwarding version rejected'
 Assert-True (-not (Test-ForwardSubagentSupport -VersionText '2.1.210 (Claude Code)')) 'unsupported forwarding version accepted'
 Assert-True (-not (Test-ForwardSubagentSupport -VersionText 'invalid')) 'invalid forwarding version accepted'
@@ -667,6 +926,15 @@ if "%CLAUDE_FAKE_MODE%"=="allowed-edit" (
 if "%CLAUDE_FAKE_MODE%"=="ignored-edit" (
   echo delegated-secret>>"%CD%\.env"
 )
+if "%CLAUDE_FAKE_MODE%"=="artifact-edit" (
+  echo delegated-change>>"%CD%\src\parser.ps1"
+  if not exist "%CD%\build" mkdir "%CD%\build"
+  echo build-output>"%CD%\build\output.txt"
+)
+if "%CLAUDE_FAKE_MODE%"=="ignore-widen" (
+  echo delegated-artifact>>"%CD%\.gitignore"
+  echo widened>"%CD%\delegated-artifact"
+)
 if "%CLAUDE_FAKE_MODE%"=="forbidden-edit" (
   if not exist "%CD%\.github\workflows" mkdir "%CD%\.github\workflows"
   echo forbidden>"%CD%\.github\workflows\ci.yml"
@@ -690,6 +958,10 @@ if "%CLAUDE_FAKE_MODE%"=="assume-unchanged-change" (
 if "%CLAUDE_FAKE_MODE%"=="ref-change" (
   git -C "%CD%" branch delegated-ref
   git -C "%CD%" tag delegated-tag
+)
+if "%CLAUDE_FAKE_MODE%"=="hook-plant" (
+  if not exist "%CD%\..\main\.git\hooks" mkdir "%CD%\..\main\.git\hooks"
+  echo exfiltrate>"%CD%\..\main\.git\hooks\pre-commit"
 )
 if "%CLAUDE_FAKE_MODE%"=="config-change" (
   git -C "%CD%" config --local delegation.fake true
@@ -913,6 +1185,37 @@ exit /b 0
     $successRawError = Get-Content -Raw -LiteralPath $successRecord.rawErrorPath
     Assert-True ($ledger.primarySessionId -eq 'fake-session') "session ID was not persisted; exit: $($successRecord.exitCode); raw output: $successRawOutput; raw error: $successRawError"
     Assert-True ($successRecord.status -eq 'needs-review') 'Claude completion must require Codex review'
+
+    # A dry run that reports a different invocation than the one that executes is
+    # worse than no dry run: the ledger now holds a session id the real run
+    # resumes, so the inspected argv has to show it.
+    $parityDryRunJson = (& $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude -DryRun | Out-String).Trim()
+    $parityDryRun = $parityDryRunJson | ConvertFrom-Json
+    $parityArguments = [string[]]@($parityDryRun.arguments | ForEach-Object { [string]$_ })
+    Assert-True ($parityArguments -ccontains '--resume') 'dry run omitted the resume the real invocation would perform'
+    $parityResumeIndex = [Array]::IndexOf($parityArguments, '--resume')
+    Assert-True ($parityArguments[$parityResumeIndex + 1] -ceq 'fake-session') 'dry run resumed a different session than the ledger records'
+    Assert-True ($parityDryRun.supportsForwardingSource -ceq 'detected') 'dry run did not probe the real CLI for forwarding support'
+    Assert-True (-not [string]::IsNullOrWhiteSpace([string]$parityDryRun.resolvedClaudeCommand)) 'dry run did not report the resolved Claude command'
+    $parityMissingDryRun = (& $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand (Join-Path $fixtureRoot 'absent-claude.cmd') -DryRun | Out-String).Trim() | ConvertFrom-Json
+    Assert-True (
+        $parityMissingDryRun.supportsForwardingSource -ceq 'claude-cli-unavailable'
+    ) 'dry run assumed forwarding support when the CLI is unavailable'
+    Assert-True (-not $parityMissingDryRun.supportsForwarding) 'dry run claimed forwarding support without a CLI to probe'
+
+    # A hook planted in the shared common directory runs under the owner account
+    # the next time Codex commits, after acceptance.
+    $env:CLAUDE_FAKE_MODE = 'hook-plant'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $hookRecord = @($ledger.tasks)[-1]
+    Assert-True ($hookRecord.repositoryViolations -contains 'hooks-changed') 'a planted Git hook was not recorded'
+    Assert-True ($hookRecord.status -eq 'rejected') 'a planted Git hook was not rejected'
+    Remove-Item -LiteralPath (Join-Path $mainRepo '.git/hooks/pre-commit') -Force -ErrorAction SilentlyContinue
     Assert-True (Test-Path -LiteralPath $successRecord.rawOutputPath) 'raw output was not captured'
     Assert-True (Test-Path -LiteralPath $successRecord.rawErrorPath) 'raw error was not captured'
     Assert-True (Test-Path -LiteralPath $successRecord.resultPath) 'normalized result was not captured'
@@ -1178,6 +1481,36 @@ exit /b 0
     Assert-True (@($allowedRecord.scopeViolations).Count -eq 0) 'allowed path was rejected'
     Assert-True ($allowedRecord.status -eq 'needs-review') 'an allowed unstaged edit was falsely classified as a repository mutation'
 
+    # A required verification command legitimately drops build and cache output
+    # outside allowedPaths. Ignored byproducts must be reported, never rejected.
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value 'build/'
+    $env:CLAUDE_FAKE_MODE = 'artifact-edit'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $artifactRecord = @($ledger.tasks)[-1]
+    Assert-True ($artifactRecord.changedDuringTask -contains 'build/output.txt') 'ignored build output bypassed fingerprinting'
+    Assert-True ($artifactRecord.ignoredArtifacts -contains 'build/output.txt') 'ignored build output was not recorded as an artifact'
+    Assert-True (-not ($artifactRecord.scopeViolations -contains 'build/output.txt')) 'a git-ignored build artifact was treated as a scope violation'
+    Assert-True (@($artifactRecord.scopeViolations).Count -eq 0) "verification artifacts rejected a compliant delegation: $(@($artifactRecord.scopeViolations) -join '|')"
+    Assert-True ($artifactRecord.status -eq 'needs-review') 'a delegation was rejected for output its own verification command created'
+
+    # Widening the ignore set is how a delegation would launder an out-of-scope
+    # write into the artifact bucket, so it must reject on its own.
+    $env:CLAUDE_FAKE_MODE = 'ignore-widen'
+    try {
+        & $Runner -WorktreePath $linked -TaskPacketPath $taskPath -ClaudeCommand $fakeClaude | Out-Null
+    } finally {
+        Remove-Item Env:\CLAUDE_FAKE_MODE -ErrorAction SilentlyContinue
+    }
+    $ledger = Get-Content -Raw -LiteralPath $state.ledgerPath | ConvertFrom-Json
+    $ignoreWidenRecord = @($ledger.tasks)[-1]
+    Assert-True ($ignoreWidenRecord.repositoryViolations -contains 'ignore-rules-changed') 'a delegated .gitignore edit was not recorded'
+    Assert-True ($ignoreWidenRecord.status -eq 'rejected') 'a delegation that widened the ignore set was not rejected'
+
     Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value '.env'
     Set-Content -LiteralPath (Join-Path $linked '.env') -Value 'ignored-before'
     $env:CLAUDE_FAKE_MODE = 'ignored-edit'
@@ -1200,6 +1533,78 @@ exit /b 0
     $windowsPatternViolations = Get-ScopeViolations -ChangedPaths @('.github/workflows/ci.yml', 'src/parser.ps1') -Task $windowsPatternTask
     Assert-True ($windowsPatternViolations -contains '.github/workflows/ci.yml') 'Windows forbidden pattern was not normalized'
     Assert-True (-not ($windowsPatternViolations -contains 'src/parser.ps1')) 'Windows allowed pattern was not normalized'
+
+    # By now the fixture .gitignore covers build/, delegated-artifact and .env.
+    $classification = Get-ScopeClassification -Worktree $linked -Task $executionTask -ChangedPaths @(
+        'src/parser.ps1', 'build/output.txt', 'not-ignored.txt', '.github/workflows/ci.yml', '.env'
+    )
+    Assert-True (-not ($classification.Violations -contains 'src/parser.ps1')) 'an allowed path was classified as a violation'
+    Assert-True (-not ($classification.IgnoredArtifacts -contains 'src/parser.ps1')) 'an allowed path was classified as an artifact'
+    Assert-True ($classification.IgnoredArtifacts -contains 'build/output.txt') 'a git-ignored byproduct was not classified as an artifact'
+    Assert-True (-not ($classification.Violations -contains 'build/output.txt')) 'a git-ignored byproduct was still counted as a violation'
+    Assert-True ($classification.Violations -contains 'not-ignored.txt') 'an untracked out-of-scope file escaped the scope check'
+    Assert-True ($classification.Violations -contains '.github/workflows/ci.yml') 'a forbidden path escaped the scope check'
+    Assert-True ($classification.Violations -contains '.env') 'a forbidden path was laundered into an artifact by .gitignore'
+    Assert-True (-not ($classification.IgnoredArtifacts -contains '.env')) 'a forbidden path was classified as an artifact'
+    Assert-True (-not $classification.ProbeFailed) 'the ignore probe failed on a healthy worktree'
+
+    # Deny rules read forbiddenPaths with gitignore depth semantics, so detection
+    # has to as well. A root-anchored match let config/.env and app/secrets/key
+    # fall past the forbidden check into the ignore probe, where the .gitignore
+    # entries that every real repository carries for these names filed them as
+    # ordinary build artifacts and downgraded a rejection to needs-review.
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value '.env'
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value 'secrets/'
+    $nestedForbidden = @('config/.env', 'app/secrets/key', 'deep/nested/.env.local')
+    $nestedClassification = Get-ScopeClassification -Worktree $linked -Task $executionTask `
+        -ChangedPaths $nestedForbidden
+    foreach ($nestedPath in $nestedForbidden) {
+        Assert-True (
+            $nestedClassification.Violations -contains $nestedPath
+        ) "a nested forbidden path was not treated as a violation: $nestedPath"
+        Assert-True (
+            -not ($nestedClassification.IgnoredArtifacts -contains $nestedPath)
+        ) "a nested forbidden path was laundered into an artifact: $nestedPath"
+        Assert-True (
+            (Get-ScopeViolations -ChangedPaths @($nestedPath) -Task $executionTask) -contains $nestedPath
+        ) "a nested forbidden path escaped Get-ScopeViolations: $nestedPath"
+    }
+
+    # The depth forms must keep the segment boundary: src/mysecrets is not
+    # covered by secrets/**, and widening forbiddenPaths must never widen
+    # allowedPaths, which stays root-anchored.
+    Assert-True (
+        -not (Test-ForbiddenPathMatch -Path 'src/mysecrets/key' -ForbiddenPatterns @('secrets/**'))
+    ) 'a depth-matched pattern matched across a segment boundary'
+    Assert-True (
+        Test-ForbiddenPathMatch -Path 'src/secrets/key' -ForbiddenPatterns @('secrets/**')
+    ) 'a nested directory pattern was not depth-matched'
+    Assert-True (
+        Test-ForbiddenPathMatch -Path 'sub/.git/config' -ForbiddenPatterns @('.git/**')
+    ) 'a nested Git directory was not depth-matched'
+    Assert-True (
+        Test-ForbiddenPathMatch -Path 'secrets/key' -ForbiddenPatterns @('secrets')
+    ) 'a bare directory pattern did not forbid the paths beneath it'
+    Assert-True (
+        (Get-ScopeViolations -ChangedPaths @('src/parser.ps1') -Task $executionTask).Count -eq 0
+    ) 'an allowed path became a violation after forbidden matching was widened'
+
+    # Git never reports a tracked file as ignored, so an out-of-scope edit to a
+    # tracked file stays a violation even when an ignore rule matches its name.
+    # seed.txt is committed in the fixture repository.
+    Add-Content -LiteralPath (Join-Path $linked '.gitignore') -Value 'seed.txt'
+    $trackedIgnoreTask = $executionTask | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    $trackedIgnoreTask.allowedPaths = @('src/**')
+    $trackedClassification = Get-ScopeClassification -Worktree $linked -Task $trackedIgnoreTask `
+        -ChangedPaths @('seed.txt')
+    Assert-True ($trackedClassification.Violations -contains 'seed.txt') 'a tracked out-of-scope file was reclassified as an artifact'
+    Assert-True (@($trackedClassification.IgnoredArtifacts).Count -eq 0) 'a tracked file was classified as an ignored artifact'
+
+    $probeFailure = Get-ScopeClassification -Worktree (Join-Path $fixtureRoot 'no-such-worktree') `
+        -Task $executionTask -ChangedPaths @('build/output.txt')
+    Assert-True $probeFailure.ProbeFailed 'a broken ignore probe was not reported'
+    Assert-True ($probeFailure.Violations -contains 'build/output.txt') 'a broken ignore probe failed open instead of closed'
+    Assert-True (@($probeFailure.IgnoredArtifacts).Count -eq 0) 'a broken ignore probe still produced artifacts'
 
     $env:CLAUDE_FAKE_MODE = 'forbidden-edit'
     try {

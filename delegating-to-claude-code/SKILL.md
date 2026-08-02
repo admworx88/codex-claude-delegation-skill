@@ -44,9 +44,17 @@ or discard prior evidence.
 
 | Mode | Select only when | Execution contract |
 |---|---|---|
-| `direct` | Work is small or tightly coupled. | One Claude process works directly. No subagents or teammates. |
+| `direct` | Work is small or tightly coupled. | One Claude process works directly. The runner removes the subagent tool, so no subagents or teammates are possible. |
 | `subagents` | A medium task has focused independent investigation, implementation, review, or test subtasks. | Send one top-level task. Claude uses focused subagents internally and returns one consolidated result. |
 | `agent-team` | Work is long and has at least two truly independent, non-overlapping workstreams. | Send one top-level task. Declare exclusive paths, keep the team small, and require conservative `maxTurns`, `timeoutSeconds`, and `maxBudgetUsd`. |
+
+**Ownership is checked, not attributed.** A filesystem snapshot cannot tell
+which teammate wrote a file, so per-teammate `ownedPaths` compliance is not
+verifiable after the fact. The runner checks the part that is: every in-scope
+change must land inside exactly one declared `ownedPaths` set. Anything in
+`allowedPaths` that no workstream owns, or that two workstreams claim, is
+recorded as `unownedPaths` for Codex review. Overlap itself is rejected when the
+packet is validated, before Claude runs.
 
 Independence does not authorize concurrent top-level delegations or multiple
 worktrees. Prepared parallel briefs, deadline pressure, and sunk cost do not
@@ -142,25 +150,81 @@ rerun the same guarded command and packet.
 
 The runner denies Claude Git access in layers: task/prompt prohibitions plus
 Bash and native PowerShell tool denial. It snapshots files, sibling worktrees,
-the index, all refs, repository/worktree configuration, HEAD, branch, remotes,
-and status before and after execution. Any forbidden-path, out-of-scope,
-Git-state, sibling-worktree, or probe violation makes the runner decision
-`rejected`.
+the index, all refs, repository/worktree configuration, exclude files, Git
+hooks, HEAD, branch, remotes, and status before and after execution. Any
+forbidden-path, out-of-scope, Git-state, hook, sibling-worktree, or probe
+violation makes the runner decision `rejected`.
+
+`forbiddenPaths` becomes enforced `Read` and `Edit` deny rules, not just prompt
+text, because a read leaves no trace in any snapshot. Each pattern is emitted
+both bare, which carries gitignore depth semantics, and worktree-absolute, since
+the CLI documents rule anchoring only for the rooted form. The runner adds
+absolute deny rules for credential locations outside the worktree (`~/.ssh`,
+`~/.aws`, `~/.claude/.credentials.json`, any `.env`, private keys), edit-denies
+both Git directories so hooks cannot be planted, edit-denies the user Git config
+directory so `~/.config/git/ignore` cannot widen the worktree's ignore set, and
+scopes the session with
+`--strict-mcp-config` and `--setting-sources user` so the delegated repository's
+own `.claude/settings.json` cannot register hooks, which are arbitrary shell
+commands.
+
+**These deny rules are defense in depth, not a sandbox.** Claude Code applies
+them to its built-in file tools and to file commands it recognizes in Bash, such
+as `cat`, `head`, and `sed`. They do not stop a subprocess that opens files
+itself, such as a Python or Node script. Run the delegation in a container or VM
+when a read of a specific path must be impossible rather than merely denied.
+
+Two deliberate limitations follow from these rules, both chosen so the guard
+stays simple enough to trust:
+
+- The `//**/.env.*` deny also blocks `.env.example` and similar templates. Deny
+  rules cannot express an exception, and narrowing the pattern to an enumerated
+  list of secret-bearing suffixes would miss whatever a project invents next.
+  When a task needs to know the shape of the configuration, put the template's
+  contents in the packet's `context` array rather than relaxing the rule.
+- A `.gitignore` edit can never be delegated: the change records
+  `ignore-rules-changed` and rejects even when `.gitignore` is listed in
+  `allowedPaths`. Distinguishing a benign entry from one that hides an
+  out-of-scope write requires understanding intent, so the runner does not try.
+  Make ignore-rule changes yourself, outside a delegation.
+
+Verification commands legitimately write build and cache output outside
+`allowedPaths`. A changed path that is outside `allowedPaths`, does not match
+`forbiddenPaths`, and is ignored by Git is recorded as `ignoredArtifacts`
+instead of `scopeViolations`; it does not reject the delegation. Three rules
+keep that from becoming a loophole: a `forbiddenPaths` match is always a
+violation regardless of Git's ignore rules — matched with the same gitignore
+depth semantics the deny rules use, so `.env*` covers `config/.env` — Git never
+reports a tracked file as ignored so tracked out-of-scope edits still reject, and
+any change to a `.gitignore` file or to an exclude file records
+`ignore-rules-changed` and rejects. The exclude fingerprint covers both
+`info/exclude` files, `core.excludesFile`, and the default user excludes file at
+`$XDG_CONFIG_HOME/git/ignore`, which Git honours even when `core.excludesFile` is
+unset. Read `ignoredArtifacts` during review; the runner does not treat it as
+clean, only as not-a-scope-violation.
 
 After a `needs-review` result, Codex must:
 
 1. Inspect the ledger, normalized result, raw logs when needed, `git status`,
    and the complete diff.
-2. Confirm every changed path is allowed and no forbidden path changed.
-3. Review correctness, security, deviations, and every acceptance criterion.
-4. Independently rerun the required verification commands; never rely only on
+2. Confirm every changed path is allowed and no forbidden path changed, and
+   review `ignoredArtifacts` for anything that is not ordinary build or cache
+   output.
+3. For `agent-team` results, review `unownedPaths`: every entry is an in-scope
+   change that landed outside every declared `ownedPaths` set. The runner records
+   it without rejecting, because a filesystem snapshot cannot attribute a write
+   to a particular teammate, so this list is only enforced by being read here.
+   Treat a non-empty `unownedPaths` as evidence the team worked outside the
+   ownership it declared, and require an explanation before accepting.
+4. Review correctness, security, deviations, and every acceptance criterion.
+5. Independently rerun the required verification commands; never rely only on
    Claude's report.
-5. Record exactly one Codex decision in the ledger:
+6. Record exactly one Codex decision in the ledger:
    - `accepted` only when the diff and independent verification pass;
    - `needs-revision` for safe but incomplete candidate work, followed by a new
      bounded packet run sequentially; or
    - `rejected` for policy, scope, Git-state, unsafe, or unreviewable output.
-6. Only after `accepted`, let Codex commit, push, and integrate the reviewed
+7. Only after `accepted`, let Codex commit, push, and integrate the reviewed
    changes.
 
 ## Prohibit Claude Git actions and preserve rejected state

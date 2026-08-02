@@ -127,9 +127,10 @@ Test-Path (Join-Path $destination 'SKILL.md')
 Test-Path (Join-Path $destination 'scripts\Invoke-ClaudeDelegation.ps1')
 Test-Path (Join-Path $destination 'references\task-packet.example.json')
 Test-Path (Join-Path $destination 'references\result-schema.json')
+Test-Path (Join-Path $destination 'agents\openai.yaml')
 ```
 
-Success prints `True` four times.
+Success prints `True` five times.
 
 ### 6. Restart Codex
 
@@ -254,10 +255,12 @@ test -f "$destination/references/task-packet.example.json" \
   && echo "Task-packet example found"
 test -f "$destination/references/result-schema.json" \
   && echo "Result schema found"
+test -f "$destination/agents/openai.yaml" \
+  && echo "Codex interface manifest found"
 ```
 
 Success prints `SKILL.md found`, `Runner found`, `Task-packet example found`,
-and `Result schema found`.
+`Result schema found`, and `Codex interface manifest found`.
 
 ### 8. Restart Codex
 
@@ -407,6 +410,7 @@ Run in PowerShell:
             'scripts\Invoke-ClaudeDelegation.ps1'
             'references\task-packet.example.json'
             'references\result-schema.json'
+            'agents\openai.yaml'
         )
         return -not ($required | Where-Object {
             -not (Test-Path -LiteralPath (Join-Path $Root $_) -PathType Leaf)
@@ -512,6 +516,7 @@ Run in Terminal:
     "scripts/Invoke-ClaudeDelegation.ps1"
     "references/task-packet.example.json"
     "references/result-schema.json"
+    "agents/openai.yaml"
   )
   verify_skill() {
     local root="$1"
@@ -793,7 +798,15 @@ owner approval.
 
 ### Local tests or GitHub Actions fail
 
-From this repository root, run the test for the current host.
+From this repository root, run the test for the current host. A third suite,
+`tests/Claude-CliContract.Tests.ps1`, checks that the installed Claude Code CLI
+still accepts every flag the runner depends on; the other two suites use a fake
+Claude command and cannot detect an upstream flag rename. It skips itself when
+Claude Code is not installed:
+
+```text
+pwsh -NoProfile -File ./tests/Claude-CliContract.Tests.ps1
+```
 
 Windows:
 
@@ -836,10 +849,36 @@ the ledger.
   accepts or rejects, and owns every Git operation.
 - Claude may edit only task-packet `allowedPaths` and returns untrusted
   candidate evidence.
-- The runner rejects forbidden paths, Git-state changes, sibling-worktree
-  changes, and unsafe packet or host conditions.
-- Claude never commits, pushes, pulls, merges, rebases, resets, checks out,
-  switches branches, stashes, tags, edits remotes, or creates worktrees.
+- The runner rejects writes to forbidden paths, out-of-scope writes, Git-state
+  changes, ignore-rule changes, Git-hook changes, sibling-worktree changes, and
+  unsafe packet or host conditions. Detection is based on before/after file and
+  Git-state snapshots, so it observes what Claude *wrote*, not what it read.
+- Reads are handled by prevention rather than detection: `forbiddenPaths`
+  becomes `Read` and `Edit` deny rules, and the runner adds absolute denies for
+  credential locations outside the worktree. Claude Code applies these to its
+  built-in file tools and to file commands it recognizes in Bash, but not to a
+  subprocess that opens files itself. Use a container or VM when a read must be
+  impossible rather than denied.
+- The delegated session runs with `--strict-mcp-config` and
+  `--setting-sources user`, so the target repository's own `.claude/settings.json`
+  and MCP configuration do not load. Settings files can register hooks, which
+  are arbitrary shell commands.
+- Build and cache output that Git ignores is recorded as `ignoredArtifacts` for
+  review rather than rejected, so a required verification command does not fail
+  its own delegation. Anything matching `forbiddenPaths`, any tracked file, and
+  any change to a `.gitignore` or exclude file still rejects. `forbiddenPaths` is
+  matched with the same gitignore depth semantics the deny rules use, so a nested
+  `config/.env` cannot be reclassified as an artifact by an ordinary ignore rule.
+- For `agent-team` mode, in-scope changes that landed outside every declared
+  `ownedPaths` set are recorded as `unownedPaths`. This is advisory and does not
+  reject: a filesystem snapshot cannot attribute a write to a teammate. It has
+  effect only if a reviewer reads it, so the review checklist requires that.
+- Claude is denied Git tool access and any commit, push, pull, merge, rebase,
+  reset, checkout, branch switch, stash, tag, remote edit, or worktree creation
+  is detected by the before/after snapshots. Denial is enforced by Claude Code
+  permission rules over Bash and PowerShell commands; work that reaches Git
+  indirectly, such as through a shell script, is caught by detection rather
+  than prevented.
 - No automatic commit or push occurs after Claude finishes. Codex acts only
   after independent review, acceptance, and owner direction.
 

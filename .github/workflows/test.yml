@@ -30,3 +30,33 @@ jobs:
       - name: Run macOS test suite
         shell: bash
         run: pwsh -NoProfile -File ./tests/Invoke-ClaudeDelegation.Mac.Tests.ps1
+
+  cli-contract:
+    runs-on: ubuntu-latest
+    # The suite bounds each probe itself; this bounds the unpinned network
+    # install that runs before it.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PowerShell
+        shell: bash
+        run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            sudo snap install powershell --classic
+          fi
+          pwsh --version
+      # continue-on-error is what actually makes the skip below reachable: a
+      # failing install script would otherwise red this job over an upstream
+      # problem unrelated to the change under test.
+      - name: Install Claude Code CLI
+        continue-on-error: true
+        shell: bash
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # Both delegation suites run against a fake claude shim, so they cannot
+      # catch an upstream flag rename. This job checks the real interface.
+      # It skips itself if the CLI could not be installed.
+      - name: Check the Claude CLI contract
+        shell: bash
+        run: pwsh -NoProfile -File ./tests/Claude-CliContract.Tests.ps1
