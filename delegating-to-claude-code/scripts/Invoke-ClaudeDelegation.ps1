@@ -9,6 +9,153 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Initialize-ParallelFileHasher() {
+    # Get-FileHash starts a PowerShell cmdlet once per file. On dependency-heavy
+    # worktrees that process overhead dominates the actual SHA256 work. Keep the
+    # content-hash guarantee, but perform the independent reads in a bounded CLR
+    # worker pool that is available in Windows PowerShell 5.1 and PowerShell 7.
+    if ($null -eq ('ClaudeDelegationFileHasher' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Security.Cryptography;
+using System.Threading.Tasks;
+
+public sealed class ClaudeDelegationFingerprintResult
+{
+    public Dictionary<string, string> Hashes { get; set; }
+    public string[] ReparsePaths { get; set; }
+    public string[] ReparseRelativePaths { get; set; }
+}
+
+public static class ClaudeDelegationFileHasher
+{
+    public static string[] HashFiles(string[] paths, int maximumParallelism)
+    {
+        var hashes = new string[paths.Length];
+        var options = new ParallelOptions { MaxDegreeOfParallelism = maximumParallelism };
+        Parallel.For(0, paths.Length, options, index =>
+        {
+            using (var algorithm = SHA256.Create())
+            using (var stream = new FileStream(
+                paths[index], FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                hashes[index] = BitConverter.ToString(algorithm.ComputeHash(stream)).Replace("-", "");
+            }
+        });
+        return hashes;
+    }
+
+    public static Dictionary<string, string> HashFingerprint(
+        string[] paths,
+        string[] relativePaths,
+        int maximumParallelism,
+        bool ignoreCase)
+    {
+        if (paths.Length != relativePaths.Length)
+        {
+            throw new ArgumentException("Path and relative-path counts must match.");
+        }
+        var comparer = ignoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        var hashes = new ConcurrentDictionary<string, string>(comparer);
+        var options = new ParallelOptions { MaxDegreeOfParallelism = maximumParallelism };
+        Parallel.For(0, paths.Length, options, index =>
+        {
+            using (var algorithm = SHA256.Create())
+            using (var stream = new FileStream(
+                paths[index], FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                hashes[relativePaths[index]] = BitConverter.ToString(
+                    algorithm.ComputeHash(stream)
+                ).Replace("-", "");
+            }
+        });
+        return new Dictionary<string, string>(hashes, comparer);
+    }
+
+    public static ClaudeDelegationFingerprintResult FingerprintWorktree(
+        string worktree,
+        int maximumParallelism,
+        bool ignoreCase)
+    {
+        var comparer = ignoreCase ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        var root = new DirectoryInfo(worktree);
+        var rootPath = root.FullName.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var prefixLength = rootPath.Length + 1;
+        var regularPaths = new List<string>();
+        var regularRelativePaths = new List<string>();
+        var reparsePaths = new List<string>();
+        var reparseRelativePaths = new List<string>();
+        var pending = new Stack<DirectoryInfo>();
+        pending.Push(root);
+
+        while (pending.Count > 0)
+        {
+            var directory = pending.Pop();
+            foreach (var file in directory.GetFiles())
+            {
+                var relative = file.FullName.Substring(prefixLength).Replace('\\', '/');
+                if (comparer.Equals(relative, ".git") ||
+                    relative.StartsWith(".codex/claude-handoff/", ignoreCase
+                        ? StringComparison.OrdinalIgnoreCase
+                        : StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                if ((file.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    reparsePaths.Add(file.FullName);
+                    reparseRelativePaths.Add(relative);
+                    continue;
+                }
+                regularPaths.Add(file.FullName);
+                regularRelativePaths.Add(relative);
+            }
+
+            foreach (var child in directory.GetDirectories())
+            {
+                var relative = child.FullName.Substring(prefixLength).Replace('\\', '/');
+                if (comparer.Equals(relative, ".git") ||
+                    comparer.Equals(relative, ".codex/claude-handoff"))
+                {
+                    continue;
+                }
+                if ((child.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    reparsePaths.Add(child.FullName);
+                    reparseRelativePaths.Add(relative);
+                    continue;
+                }
+                pending.Push(child);
+            }
+        }
+
+        return new ClaudeDelegationFingerprintResult
+        {
+            Hashes = HashFingerprint(
+                regularPaths.ToArray(),
+                regularRelativePaths.ToArray(),
+                maximumParallelism,
+                ignoreCase),
+            ReparsePaths = reparsePaths.ToArray(),
+            ReparseRelativePaths = reparseRelativePaths.ToArray()
+        };
+    }
+}
+'@
+    }
+
+}
+
+function Get-ParallelFileHashes([string[]]$Paths) {
+    if ($null -eq $Paths -or $Paths.Count -eq 0) { return [string[]]@() }
+    Initialize-ParallelFileHasher
+    $maximumParallelism = [Math]::Max(1, [Math]::Min(8, [Environment]::ProcessorCount))
+    return [ClaudeDelegationFileHasher]::HashFiles($Paths, $maximumParallelism)
+}
+
 function Invoke-DelegationNativeCommand([string]$Command, [string[]]$Arguments) {
     # Windows PowerShell 5.1 converts native stderr into terminating errors when
     # the stream is redirected while $ErrorActionPreference is 'Stop'. Git and
@@ -157,7 +304,11 @@ function New-PathIdentityMap([string]$Platform) {
     return [System.Collections.Hashtable]::new($comparer)
 }
 
-function Get-PathIdentityKeyUnion([hashtable]$Before, [hashtable]$After, [string]$Platform) {
+function Get-PathIdentityKeyUnion(
+    [System.Collections.IDictionary]$Before,
+    [System.Collections.IDictionary]$After,
+    [string]$Platform
+) {
     $keys = New-PathIdentityMap -Platform $Platform
     foreach ($key in @($Before.Keys) + @($After.Keys)) { $keys[$key] = $true }
     return @($keys.Keys | Sort-Object)
@@ -616,29 +767,29 @@ function New-ClaudeInvocation($Task, [string]$SessionId, [bool]$SupportsForwardi
     $taskJson = ConvertTo-AsciiJson -Json ($Task | ConvertTo-Json -Depth 12)
     $prompt = "Execute the bounded task packet below. $modeDirective Do not commit, push, switch branches, modify remotes, or expand scope.`n`n" +
               $taskJson
-    $args = @('-p', '--dangerously-skip-permissions', '--output-format', 'json',
-              '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
-    $args += '--disallowedTools'
-    $args += Get-DelegationDenyRules -Task $Task -Context $Context
+    $claudeArguments = @('-p', '--dangerously-skip-permissions', '--output-format', 'json',
+                         '--json-schema', $schema, '--max-turns', [string]$Task.limits.maxTurns)
+    $claudeArguments += '--disallowedTools'
+    $claudeArguments += Get-DelegationDenyRules -Task $Task -Context $Context
     # The worktree's own .claude/settings.json and MCP config are attacker-shaped
     # input when the delegated repository is not fully trusted: settings files
     # can register hooks, which are arbitrary shell commands.
-    $args += @('--strict-mcp-config', '--setting-sources', 'user')
+    $claudeArguments += @('--strict-mcp-config', '--setting-sources', 'user')
 
     $environment = @{}
     $fresh = $Task.mode -eq 'agent-team'
-    if (-not $fresh -and $SessionId) { $args += @('--resume', $SessionId) }
+    if (-not $fresh -and $SessionId) { $claudeArguments += @('--resume', $SessionId) }
     if ($Task.limits.PSObject.Properties.Name -contains 'maxBudgetUsd') {
-        $args += @('--max-budget-usd', [string]$Task.limits.maxBudgetUsd)
+        $claudeArguments += @('--max-budget-usd', [string]$Task.limits.maxBudgetUsd)
     }
     if ($Task.mode -ne 'direct' -and $SupportsForwarding) {
-        $outputIndex = [Array]::IndexOf([object[]]$args, '--output-format')
-        $args[$outputIndex + 1] = 'stream-json'
-        $args += @('--verbose', '--forward-subagent-text')
+        $outputIndex = [Array]::IndexOf([object[]]$claudeArguments, '--output-format')
+        $claudeArguments[$outputIndex + 1] = 'stream-json'
+        $claudeArguments += @('--verbose', '--forward-subagent-text')
     }
     if ($fresh) { $environment['CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS'] = '1' }
     [pscustomobject]@{
-        arguments = [object[]]$args
+        arguments = [object[]]$claudeArguments
         environment = $environment
         freshSession = $fresh
         standardInput = $prompt
@@ -661,14 +812,24 @@ function Resolve-ClaudeCommandPath([string]$Command) {
     return [System.IO.Path]::GetFullPath($path)
 }
 
+function Test-ClaudeAuthenticationStatus($Status) {
+    if ($null -eq $Status -or $Status -isnot [pscustomobject]) { return $false }
+    $propertyNames = @($Status.PSObject.Properties.Name)
+    foreach ($name in @('loggedIn', 'authenticated')) {
+        if ($propertyNames -ccontains $name) {
+            $value = $Status.$name
+            return $value -is [bool] -and [bool]$value
+        }
+    }
+    return $false
+}
+
 function Test-ClaudeAuthenticated([string]$Command) {
     try {
         $result = Invoke-DelegationNativeCommand -Command $Command -Arguments @('auth', 'status')
         if ($result.ExitCode -ne 0) { return $false }
         $status = $result.StandardOutput | ConvertFrom-Json
-        if ($null -ne $status.loggedIn) { return [bool]$status.loggedIn }
-        if ($null -ne $status.authenticated) { return [bool]$status.authenticated }
-        return $true
+        return Test-ClaudeAuthenticationStatus -Status $status
     } catch {
         return $false
     }
@@ -964,42 +1125,27 @@ function Get-ReparseEntryFingerprint([System.IO.FileSystemInfo]$Entry) {
 }
 
 function Get-WorktreeFingerprint([string]$Worktree) {
-    $map = New-PathIdentityMap -Platform (Get-DelegationPlatform)
-    $root = Get-Item -LiteralPath $Worktree -ErrorAction Stop
-    $rootPrefixLength = $root.FullName.TrimEnd('\', '/').Length + 1
-    $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
-    $pending.Push($root)
-    while ($pending.Count -gt 0) {
-        $directory = $pending.Pop()
-        foreach ($file in $directory.GetFiles()) {
-            $relative = $file.FullName.Substring($rootPrefixLength).Replace('\', '/')
-            if ((Test-CanonicalPathEqual -Left $relative -Right '.git' -Platform (Get-DelegationPlatform)) -or
-                $relative.StartsWith('.codex/claude-handoff/', (Get-PathStringComparison (Get-DelegationPlatform)))) {
-                continue
-            }
-            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                $map[$relative] = Get-ReparseEntryFingerprint -Entry $file
-                continue
-            }
-            $map[$relative] = (Get-FileHash -Algorithm SHA256 -LiteralPath $file.FullName).Hash
-        }
-        foreach ($child in $directory.GetDirectories()) {
-            $relative = $child.FullName.Substring($rootPrefixLength).Replace('\', '/')
-            if ((Test-CanonicalPathEqual -Left $relative -Right '.git' -Platform (Get-DelegationPlatform)) -or
-                (Test-CanonicalPathEqual -Left $relative -Right '.codex/claude-handoff' -Platform (Get-DelegationPlatform))) {
-                continue
-            }
-            if (($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                $map[$relative] = Get-ReparseEntryFingerprint -Entry $child
-                continue
-            }
-            $pending.Push($child)
-        }
+    $platform = Get-DelegationPlatform
+    $maximumParallelism = [Math]::Max(1, [Math]::Min(8, [Environment]::ProcessorCount))
+    $ignoreCase = (Get-PathStringComparison -Platform $platform) -eq [System.StringComparison]::OrdinalIgnoreCase
+    Initialize-ParallelFileHasher
+    $result = [ClaudeDelegationFileHasher]::FingerprintWorktree(
+        $Worktree,
+        $maximumParallelism,
+        $ignoreCase
+    )
+    $map = $result.Hashes
+    for ($index = 0; $index -lt $result.ReparsePaths.Count; $index++) {
+        $entry = Get-Item -LiteralPath $result.ReparsePaths[$index] -Force -ErrorAction Stop
+        $map[$result.ReparseRelativePaths[$index]] = Get-ReparseEntryFingerprint -Entry $entry
     }
     return $map
 }
 
-function Compare-WorktreeFingerprint([hashtable]$Before, [hashtable]$After) {
+function Compare-WorktreeFingerprint(
+    [System.Collections.IDictionary]$Before,
+    [System.Collections.IDictionary]$After
+) {
     $all = Get-PathIdentityKeyUnion -Before $Before -After $After -Platform (Get-DelegationPlatform)
     return @($all | Where-Object { $Before[$_] -cne $After[$_] })
 }
@@ -1009,7 +1155,7 @@ function Get-FileIdentity([string]$Path) {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
 }
 
-function ConvertTo-StableFingerprint([hashtable]$Fingerprint) {
+function ConvertTo-StableFingerprint([System.Collections.IDictionary]$Fingerprint) {
     return (($Fingerprint.Keys | Sort-Object | ForEach-Object { "$_=$($Fingerprint[$_])" }) -join "`n")
 }
 
