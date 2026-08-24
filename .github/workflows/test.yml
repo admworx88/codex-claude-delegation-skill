@@ -60,3 +60,27 @@ jobs:
       - name: Check the Claude CLI contract
         shell: bash
         run: pwsh -NoProfile -File ./tests/Claude-CliContract.Tests.ps1
+
+  live-cli-enforcement:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PowerShell
+        shell: bash
+        run: |
+          if ! command -v pwsh >/dev/null 2>&1; then
+            sudo snap install powershell --classic
+          fi
+          pwsh --version
+      - name: Install Claude Code CLI
+        shell: bash
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Require authenticated enforcement probes
+        shell: bash
+        run: pwsh -NoProfile -File ./tests/Claude-CliContract.Tests.ps1 -RequireLiveEnforcement

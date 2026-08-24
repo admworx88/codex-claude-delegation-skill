@@ -113,6 +113,44 @@ Assert-True (
 
 . $runner -LibraryMode
 
+Assert-True (Test-ClaudeAuthenticationStatus ([pscustomobject]@{ loggedIn = $true })) 'Boolean loggedIn true must authenticate'
+Assert-True (Test-ClaudeAuthenticationStatus ([pscustomobject]@{ authenticated = $true })) 'Boolean authenticated true must authenticate'
+Assert-True (-not (Test-ClaudeAuthenticationStatus $null)) 'empty authentication output must fail closed'
+Assert-True (-not (Test-ClaudeAuthenticationStatus ([pscustomobject]@{}))) 'unknown authentication shape must fail closed'
+Assert-True (-not (Test-ClaudeAuthenticationStatus ([pscustomobject]@{ authenticated = 'true' }))) 'string authentication values must fail closed'
+Assert-True (-not (Test-ClaudeAuthenticated '/usr/bin/true')) 'a successful auth command with empty output must fail closed'
+
+$parallelHashRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+    'claude-delegation-parallel-hash-' + [guid]::NewGuid().ToString('N')
+)
+try {
+    New-Item -ItemType Directory -Path $parallelHashRoot -Force | Out-Null
+    $parallelHashFiles = @(
+        Join-Path $parallelHashRoot 'one.txt'
+        Join-Path $parallelHashRoot 'two.txt'
+    )
+    [System.IO.File]::WriteAllText($parallelHashFiles[0], 'one')
+    [System.IO.File]::WriteAllText($parallelHashFiles[1], 'two')
+    $parallelHashes = @(Get-ParallelFileHashes -Paths $parallelHashFiles)
+    Assert-True ($parallelHashes.Count -eq 2) 'parallel hashing must return one result per file'
+    for ($hashIndex = 0; $hashIndex -lt $parallelHashFiles.Count; $hashIndex++) {
+        $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $parallelHashFiles[$hashIndex]).Hash
+        Assert-True ($parallelHashes[$hashIndex] -ceq $expectedHash) 'parallel hashing must preserve SHA256 content identities'
+    }
+    $beforeSameMetadataEdit = Get-WorktreeFingerprint -Worktree $parallelHashRoot
+    $preservedWriteTime = (Get-Item -LiteralPath $parallelHashFiles[0]).LastWriteTimeUtc
+    [System.IO.File]::WriteAllText($parallelHashFiles[0], 'uno')
+    (Get-Item -LiteralPath $parallelHashFiles[0]).LastWriteTimeUtc = $preservedWriteTime
+    $afterSameMetadataEdit = Get-WorktreeFingerprint -Worktree $parallelHashRoot
+    Assert-True (
+        (Compare-WorktreeFingerprint -Before $beforeSameMetadataEdit -After $afterSameMetadataEdit) -ccontains 'one.txt'
+    ) 'fingerprinting must detect same-size content changes with a restored mtime'
+} finally {
+    if (Test-Path -LiteralPath $parallelHashRoot) {
+        Remove-Item -LiteralPath $parallelHashRoot -Recurse -Force
+    }
+}
+
 Assert-True (
     (Resolve-LinkTargetPath -Candidate '/var' -Target 'private/var') -ceq '/private/var'
 ) 'a root-level relative symlink target must resolve from the filesystem root'

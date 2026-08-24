@@ -148,60 +148,16 @@ rerun the same guarded command and packet.
 
 ## Review and verify independently
 
-The runner denies Claude Git access in layers: task/prompt prohibitions plus
-Bash and native PowerShell tool denial. It snapshots files, sibling worktrees,
-the index, all refs, repository/worktree configuration, exclude files, Git
-hooks, HEAD, branch, remotes, and status before and after execution. Any
-forbidden-path, out-of-scope, Git-state, hook, sibling-worktree, or probe
-violation makes the runner decision `rejected`.
+The runner combines deny rules with before/after filesystem and Git-state
+snapshots. Any forbidden-path, out-of-scope, Git-state, hook,
+sibling-worktree, or probe violation makes its decision `rejected`. These
+controls are defense in depth, not an operating-system sandbox; use a container
+or VM when an accessible host path must be impossible to read.
 
-`forbiddenPaths` becomes enforced `Read` and `Edit` deny rules, not just prompt
-text, because a read leaves no trace in any snapshot. Each pattern is emitted
-both bare, which carries gitignore depth semantics, and worktree-absolute, since
-the CLI documents rule anchoring only for the rooted form. The runner adds
-absolute deny rules for credential locations outside the worktree (`~/.ssh`,
-`~/.aws`, `~/.claude/.credentials.json`, any `.env`, private keys), edit-denies
-both Git directories so hooks cannot be planted, edit-denies the user Git config
-directory so `~/.config/git/ignore` cannot widen the worktree's ignore set, and
-scopes the session with
-`--strict-mcp-config` and `--setting-sources user` so the delegated repository's
-own `.claude/settings.json` cannot register hooks, which are arbitrary shell
-commands.
-
-**These deny rules are defense in depth, not a sandbox.** Claude Code applies
-them to its built-in file tools and to file commands it recognizes in Bash, such
-as `cat`, `head`, and `sed`. They do not stop a subprocess that opens files
-itself, such as a Python or Node script. Run the delegation in a container or VM
-when a read of a specific path must be impossible rather than merely denied.
-
-Two deliberate limitations follow from these rules, both chosen so the guard
-stays simple enough to trust:
-
-- The `//**/.env.*` deny also blocks `.env.example` and similar templates. Deny
-  rules cannot express an exception, and narrowing the pattern to an enumerated
-  list of secret-bearing suffixes would miss whatever a project invents next.
-  When a task needs to know the shape of the configuration, put the template's
-  contents in the packet's `context` array rather than relaxing the rule.
-- A `.gitignore` edit can never be delegated: the change records
-  `ignore-rules-changed` and rejects even when `.gitignore` is listed in
-  `allowedPaths`. Distinguishing a benign entry from one that hides an
-  out-of-scope write requires understanding intent, so the runner does not try.
-  Make ignore-rule changes yourself, outside a delegation.
-
-Verification commands legitimately write build and cache output outside
-`allowedPaths`. A changed path that is outside `allowedPaths`, does not match
-`forbiddenPaths`, and is ignored by Git is recorded as `ignoredArtifacts`
-instead of `scopeViolations`; it does not reject the delegation. Three rules
-keep that from becoming a loophole: a `forbiddenPaths` match is always a
-violation regardless of Git's ignore rules — matched with the same gitignore
-depth semantics the deny rules use, so `.env*` covers `config/.env` — Git never
-reports a tracked file as ignored so tracked out-of-scope edits still reject, and
-any change to a `.gitignore` file or to an exclude file records
-`ignore-rules-changed` and rejects. The exclude fingerprint covers both
-`info/exclude` files, `core.excludesFile`, and the default user excludes file at
-`$XDG_CONFIG_HOME/git/ignore`, which Git honours even when `core.excludesFile` is
-unset. Read `ignoredArtifacts` during review; the runner does not treat it as
-clean, only as not-a-scope-violation.
+Before changing guard behavior, reviewing its security assumptions, or deciding
+whether an unusual `ignoredArtifacts` or repository violation is safe, read
+[references/security-model.md](references/security-model.md). Make `.gitignore`
+changes yourself; a delegated `.gitignore` edit is always rejected.
 
 After a `needs-review` result, Codex must:
 
