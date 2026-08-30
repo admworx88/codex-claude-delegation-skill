@@ -767,6 +767,18 @@ ls -l "<linked-worktree>/.codex/claude-handoff/"*.command
 chmod 700 "/absolute/path/to/generated-owner-setup.command"
 ```
 
+For a normal visible Claude session, have Codex invoke the runner with
+`-VisibleTerminal`. This opens a second Terminal window and streams Claude's
+output there while Codex waits for the guarded result:
+
+```bash
+pwsh -NoProfile -File \
+  "/Users/aljonmoliva/.agents/skills/delegating-to-claude-code/scripts/Invoke-ClaudeDelegation.ps1" \
+  -WorktreePath "/absolute/path/to/linked-worktree" \
+  -TaskPacketPath "/absolute/path/to/linked-worktree/.codex/claude-handoff/task-001.json" \
+  -VisibleTerminal
+```
+
 Then return to Codex and retry. Do not apply recursive permission changes to
 the repository or home directory.
 

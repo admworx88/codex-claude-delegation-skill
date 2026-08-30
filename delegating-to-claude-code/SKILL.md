@@ -132,6 +132,16 @@ pwsh -NoProfile -File $runner `
   -WorktreePath $worktree -TaskPacketPath $packet
 ```
 
+To watch Claude run in a second normal macOS Terminal window, add
+`-VisibleTerminal` to the execution command. Claude's output is streamed into
+that window while the runner continues waiting for completion and collecting
+the normal evidence.
+
+```powershell
+pwsh -NoProfile -File $runner `
+  -WorktreePath $worktree -TaskPacketPath $packet -VisibleTerminal
+```
+
 Wait for the top-level invocation to finish. Review it before preparing any
 revision packet or starting the next sequential delegation.
 

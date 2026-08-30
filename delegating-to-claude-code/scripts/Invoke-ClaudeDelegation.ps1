@@ -4,6 +4,7 @@ param(
     [string]$TaskPacketPath,
     [string]$ClaudeCommand = 'claude',
     [switch]$DryRun,
+    [switch]$VisibleTerminal,
     [switch]$LibraryMode
 )
 
@@ -1403,8 +1404,87 @@ function Invoke-ClaudeProcess(
     [string]$ClaudeCommand,
     [decimal]$TimeoutSeconds,
     [string]$RawOutputPath,
-    [string]$RawErrorPath
+    [string]$RawErrorPath,
+    [switch]$VisibleTerminal
 ) {
+    if ($VisibleTerminal) {
+        if ((Get-DelegationPlatform) -ne 'MacOS') {
+            throw 'VisibleTerminal is supported only on macOS.'
+        }
+
+        $stateDirectory = Split-Path -Parent $RawOutputPath
+        $runStem = [System.IO.Path]::GetFileNameWithoutExtension($RawOutputPath)
+        $promptPath = Join-Path $stateDirectory "$runStem.prompt.txt"
+        $scriptPath = Join-Path $stateDirectory "$runStem.command"
+        $pidPath = Join-Path $stateDirectory "$runStem.claude.pid"
+        $completionPath = Join-Path $stateDirectory "$runStem.exit"
+        [System.IO.File]::WriteAllText($promptPath, [string]$Invocation.standardInput, [System.Text.UTF8Encoding]::new($false))
+
+        $quotedArguments = @($Invocation.arguments | ForEach-Object { ConvertTo-PosixSingleQuotedString ([string]$_) }) -join ' '
+        $quotedCommand = ConvertTo-PosixSingleQuotedString $ClaudeCommand
+        $quotedWorktree = ConvertTo-PosixSingleQuotedString $Context.worktreePath
+        $quotedPrompt = ConvertTo-PosixSingleQuotedString $promptPath
+        $quotedOutput = ConvertTo-PosixSingleQuotedString $RawOutputPath
+        $quotedError = ConvertTo-PosixSingleQuotedString $RawErrorPath
+        $quotedPid = ConvertTo-PosixSingleQuotedString $pidPath
+        $quotedCompletion = ConvertTo-PosixSingleQuotedString $completionPath
+        $teamEnvironment = if ($Invocation.environment.ContainsKey('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS')) {
+            "export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS='1'"
+        } else {
+            "unset CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
+        }
+        $visibleScript = @(
+            '#!/bin/zsh'
+            "cd -- $quotedWorktree"
+            $teamEnvironment
+            "$quotedCommand $quotedArguments < $quotedPrompt > >(tee $quotedOutput) 2> >(tee $quotedError >&2) &"
+            'claude_pid=$!'
+            "printf '%s\\n' `$claude_pid > $quotedPid"
+            'wait $claude_pid'
+            'code=$?'
+            "printf '%s\\n' `$code > $quotedCompletion"
+            "printf '%s\\n' 'Codex delegation finished. This Terminal remains open for inspection.'"
+            'read -r'
+        ) -join "`n"
+        [System.IO.File]::WriteAllText($scriptPath, "$visibleScript`n", [System.Text.UTF8Encoding]::new($false))
+        & chmod 700 $scriptPath
+        if ($LASTEXITCODE -ne 0) { throw "Failed to secure visible Claude launcher: $scriptPath" }
+
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = 'open'
+        $startInfo.WorkingDirectory = $Context.worktreePath
+        $startInfo.UseShellExecute = $false
+        foreach ($argument in @('-a', 'Terminal', $scriptPath)) { [void]$startInfo.ArgumentList.Add($argument) }
+        $launcher = [System.Diagnostics.Process]::new()
+        $launcher.StartInfo = $startInfo
+        try {
+            if (-not $launcher.Start()) { throw 'Failed to open macOS Terminal.' }
+            $launcher.WaitForExit()
+            if ($launcher.ExitCode -ne 0) { throw "macOS Terminal launch failed with exit code $($launcher.ExitCode)." }
+        } finally { $launcher.Dispose() }
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path -LiteralPath $completionPath -PathType Leaf) -and $watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+            [System.Threading.Thread]::Sleep(100)
+        }
+        $timedOut = -not (Test-Path -LiteralPath $completionPath -PathType Leaf)
+        if ($timedOut -and (Test-Path -LiteralPath $pidPath -PathType Leaf)) {
+            $claudePid = [int](Get-Content -Raw -LiteralPath $pidPath).Trim()
+            & kill -TERM $claudePid 2>$null
+        }
+        $stdout = if (Test-Path -LiteralPath $RawOutputPath) { Get-Content -Raw -LiteralPath $RawOutputPath } else { '' }
+        $stderr = if (Test-Path -LiteralPath $RawErrorPath) { Get-Content -Raw -LiteralPath $RawErrorPath } else { '' }
+        return [pscustomobject]@{
+            ExitCode = if ($timedOut) { $null } else { [int](Get-Content -Raw -LiteralPath $completionPath).Trim() }
+            TimedOut = $timedOut
+            StandardOutput = $stdout
+            StandardError = $stderr
+            InputError = $null
+            RawOutputPath = $RawOutputPath
+            RawErrorPath = $RawErrorPath
+        }
+    }
+
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $ClaudeCommand
     $startInfo.WorkingDirectory = $Context.worktreePath
@@ -1691,7 +1771,7 @@ function Get-ClaudeVersionSupport([string]$ClaudeCommand) {
     }
 }
 
-function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
+function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand, [switch]$VisibleTerminal) {
     $lockAcquired = $false
     $lockHandle = $null
     try {
@@ -1721,7 +1801,8 @@ function Invoke-Delegation($Context, $State, $Task, [string]$ClaudeCommand) {
             $rawOutputPath = Join-Path $State.stateDir "$runToken-attempt-$attemptNumber.stdout.log"
             $rawErrorPath = Join-Path $State.stateDir "$runToken-attempt-$attemptNumber.stderr.log"
             $process = Invoke-ClaudeProcess -Context $Context -Invocation $invocation -ClaudeCommand $resolvedClaudeCommand `
-                -TimeoutSeconds $Task.limits.timeoutSeconds -RawOutputPath $rawOutputPath -RawErrorPath $rawErrorPath
+                -TimeoutSeconds $Task.limits.timeoutSeconds -RawOutputPath $rawOutputPath -RawErrorPath $rawErrorPath `
+                -VisibleTerminal:$VisibleTerminal
             $wasResumed = $invocation.arguments -contains '--resume'
             $attempts += [pscustomobject][ordered]@{
                 number = $attemptNumber
@@ -1893,5 +1974,6 @@ if (-not $LibraryMode) {
         Show-OwnerSetup -Worktree $context.worktreePath -StateDirectory $state.stateDir -Installed $true
         throw 'Claude Code authentication requires owner action.'
     }
-    Invoke-Delegation -Context $context -State $state -Task $task -ClaudeCommand $resolvedClaudeCommand | ConvertTo-Json -Depth 12
+    Invoke-Delegation -Context $context -State $state -Task $task -ClaudeCommand $resolvedClaudeCommand `
+        -VisibleTerminal:$VisibleTerminal | ConvertTo-Json -Depth 12
 }
