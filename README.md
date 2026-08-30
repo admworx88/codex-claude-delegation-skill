@@ -767,9 +767,10 @@ ls -l "<linked-worktree>/.codex/claude-handoff/"*.command
 chmod 700 "/absolute/path/to/generated-owner-setup.command"
 ```
 
-For a normal visible Claude session, have Codex invoke the runner with
-`-VisibleTerminal`. This opens a second Terminal window and streams Claude's
-output there while Codex waits for the guarded result:
+For a normal visible Claude session, start Codex inside tmux and have it invoke
+the runner with `-VisibleTerminal`. This opens a visible tmux pane in the
+current terminal and streams Claude's output there while Codex waits for the
+guarded result:
 
 ```bash
 pwsh -NoProfile -File \
@@ -778,6 +779,22 @@ pwsh -NoProfile -File \
   -TaskPacketPath "/absolute/path/to/linked-worktree/.codex/claude-handoff/task-001.json" \
   -VisibleTerminal
 ```
+
+Start tmux first when needed:
+
+```bash
+tmux new -s codex
+```
+
+If tmux is not installed, run the explicit macOS setup script:
+
+```bash
+pwsh -NoProfile -File \
+  "/Users/aljonmoliva/.agents/skills/delegating-to-claude-code/scripts/Install-Tmux.ps1"
+```
+
+The setup script uses Homebrew, does not install silently, and verifies the
+result. Then start tmux and rerun the delegation.
 
 Then return to Codex and retry. Do not apply recursive permission changes to
 the repository or home directory.

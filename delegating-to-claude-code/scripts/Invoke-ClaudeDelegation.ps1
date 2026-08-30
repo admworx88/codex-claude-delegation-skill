@@ -1411,6 +1411,10 @@ function Invoke-ClaudeProcess(
         if ((Get-DelegationPlatform) -ne 'MacOS') {
             throw 'VisibleTerminal is supported only on macOS.'
         }
+        if ($null -eq (Get-Command tmux -CommandType Application -ErrorAction SilentlyContinue)) {
+            $installer = Join-Path $PSScriptRoot 'Install-Tmux.ps1'
+            throw "tmux is not installed. Run: pwsh -NoProfile -File '$installer'"
+        }
 
         $stateDirectory = Split-Path -Parent $RawOutputPath
         $runStem = [System.IO.Path]::GetFileNameWithoutExtension($RawOutputPath)
@@ -1428,6 +1432,7 @@ function Invoke-ClaudeProcess(
         $quotedError = ConvertTo-PosixSingleQuotedString $RawErrorPath
         $quotedPid = ConvertTo-PosixSingleQuotedString $pidPath
         $quotedCompletion = ConvertTo-PosixSingleQuotedString $completionPath
+        $quotedScriptPath = ConvertTo-PosixSingleQuotedString $scriptPath
         $teamEnvironment = if ($Invocation.environment.ContainsKey('CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS')) {
             "export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS='1'"
         } else {
@@ -1450,18 +1455,17 @@ function Invoke-ClaudeProcess(
         & chmod 700 $scriptPath
         if ($LASTEXITCODE -ne 0) { throw "Failed to secure visible Claude launcher: $scriptPath" }
 
-        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName = 'open'
-        $startInfo.WorkingDirectory = $Context.worktreePath
-        $startInfo.UseShellExecute = $false
-        foreach ($argument in @('-a', 'Terminal', $scriptPath)) { [void]$startInfo.ArgumentList.Add($argument) }
-        $launcher = [System.Diagnostics.Process]::new()
-        $launcher.StartInfo = $startInfo
-        try {
-            if (-not $launcher.Start()) { throw 'Failed to open macOS Terminal.' }
-            $launcher.WaitForExit()
-            if ($launcher.ExitCode -ne 0) { throw "macOS Terminal launch failed with exit code $($launcher.ExitCode)." }
-        } finally { $launcher.Dispose() }
+        if ([string]::IsNullOrWhiteSpace($env:TMUX)) {
+            throw 'VisibleTerminal requires an active tmux session. Start one with: tmux new -s codex'
+        }
+        $tmuxCommand = "exec $quotedScriptPath"
+        $tmuxLaunch = Invoke-DelegationNativeCommand -Command 'tmux' -Arguments @(
+            'split-window', '-P', '-F', '#{pane_id}', '-h', $tmuxCommand
+        )
+        if ($tmuxLaunch.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($tmuxLaunch.StandardOutput)) {
+            throw "tmux pane launch failed: $($tmuxLaunch.Combined)"
+        }
+        $paneId = $tmuxLaunch.StandardOutput.Trim()
 
         $watch = [System.Diagnostics.Stopwatch]::StartNew()
         while (-not (Test-Path -LiteralPath $completionPath -PathType Leaf) -and $watch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
@@ -1472,6 +1476,7 @@ function Invoke-ClaudeProcess(
             $claudePid = [int](Get-Content -Raw -LiteralPath $pidPath).Trim()
             & kill -TERM $claudePid 2>$null
         }
+        if ($timedOut) { & tmux kill-pane -t $paneId 2>$null }
         $stdout = if (Test-Path -LiteralPath $RawOutputPath) { Get-Content -Raw -LiteralPath $RawOutputPath } else { '' }
         $stderr = if (Test-Path -LiteralPath $RawErrorPath) { Get-Content -Raw -LiteralPath $RawErrorPath } else { '' }
         return [pscustomobject]@{

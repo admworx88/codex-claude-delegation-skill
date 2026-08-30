@@ -138,10 +138,14 @@ pwsh -NoProfile -File $runner `
   -WorktreePath $worktree -TaskPacketPath $packet
 ```
 
-To watch Claude run in a second normal macOS Terminal window, add
-`-VisibleTerminal` to the execution command. Claude's output is streamed into
-that window while the runner continues waiting for completion and collecting
-the normal evidence.
+To watch Claude run in the current terminal through a visible tmux pane, add
+`-VisibleTerminal` on macOS. Start Codex inside tmux first, for example with
+`tmux new -s codex`. Claude's output is streamed into the pane while the runner
+continues waiting for completion and collecting the normal evidence. The flag
+fails clearly when tmux is unavailable or no active tmux session is available.
+The runner does not install tmux automatically. If it is missing, run the
+explicit owner setup script `scripts/Install-Tmux.ps1`, then start tmux and
+rerun the same delegation.
 
 ```powershell
 pwsh -NoProfile -File $runner `
