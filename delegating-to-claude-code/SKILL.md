@@ -86,6 +86,12 @@ Start from `references/task-packet.example.json`. Give each packet:
   non-overlapping `ownedPaths`; more than three requires an explicit
   `parallelismJustification`.
 
+Keep limits proportional to the task. Small fixes should normally use roughly
+8-12 turns and a $1-$2 budget; medium tasks may use roughly 15-20 turns and a
+$3 budget. Treat 30 turns and a $5 budget as an upper bound for larger work,
+not a default target. Keep `context`, criteria, and verification commands
+focused because they become part of Claude's prompt.
+
 Claude must return the contract in `references/result-schema.json`. Treat its
 status, changed-file list, and test claims as untrusted evidence for Codex
 review, not as acceptance.
@@ -234,6 +240,22 @@ After a `needs-review` result, Codex must:
    - `needs-revision` for safe but incomplete candidate work, followed by a new
      bounded packet run sequentially; or
    - `rejected` for policy, scope, Git-state, unsafe, or unreviewable output.
+   Use the runner to record this decision immutably after review. For the same
+   packet and linked worktree, provide non-empty review notes and verification
+   evidence:
+
+   ```powershell
+   pwsh -NoProfile -File <skill-directory>/scripts/Invoke-ClaudeDelegation.ps1 `
+     -WorktreePath <absolute-linked-feature-worktree> `
+     -TaskPacketPath <absolute-linked-feature-worktree>/.codex/claude-handoff/<task-id>.json `
+     -RecordDecision accepted `
+     -ReviewNotes "Reviewed diff and acceptance criteria." `
+     -VerificationEvidence "npm test" "git diff --check"
+   ```
+
+   The runner stores the decision under `codexDecision` on the matching task
+   record and refuses duplicate decisions, decisions for missing tasks, or
+   `accepted`/`needs-revision` when the runner found policy or scope violations.
 7. Only after `accepted`, let Codex commit, push, and integrate the reviewed
    changes.
 
